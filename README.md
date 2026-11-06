@@ -88,8 +88,8 @@ Open the mixer by right-clicking either Wavemix icon in the bar. Inside the
 panel:
 
 - `j` / `k` move between controls
-- `h` / `l` adjust a fader or cycle a device
-- `Enter` toggle a send, mute, or dropdown
+- `h` / `l` adjust the focused send fader
+- `Enter` toggle a send or mute, open a device dropdown, or add/remove items
 - `Esc` close
 
 The thin bar under each channel name is its live level meter. It reads the
@@ -128,14 +128,18 @@ and contains:
   description, version, source, GPU badge, and install hint. Unavailable
   plugins stay visible but cannot be added.
 
-Structural changes (add, remove, move, bypass, or a manifest becoming
-unavailable) regenerate the config and restart PipeWire briefly; the popup
-shows `Applying… audio restarts briefly`. Control changes and the master switch
-do not restart PipeWire. A bypassed effect keeps its stored controls but is
-excluded from the compiled chain.
+Structural changes (add, remove, move, bypass) regenerate the config and
+restart PipeWire briefly; the popup shows `Applying… audio restarts briefly`.
+A manifest becoming unavailable is picked up on the next
+`fx add/remove/move/toggle` or `fx apply`; there is no automatic file-watcher
+trigger. Control changes and the master switch do not restart PipeWire. A
+bypassed effect keeps its stored controls but is excluded from the compiled
+chain.
 
-Unavailable effects and effects whose manifest version changed show an error
-row and an install hint; the rest of the chain keeps working.
+Unavailable effects stay in the chain as an `unavailable` row, and the selected
+effect's settings show the error and install hint; the rest of the chain keeps
+working. An effect whose manifest version changed keeps its stored controls and
+shows a warning in its settings area, not an error row.
 
 ## Effect manifests
 
@@ -228,8 +232,10 @@ All bundled manifests are definition version `1.0.0` and require Wavemix
 | `deepfilternet` | DeepFilterNet | LADSPA | no | Optional; `requires: Install deepfilternet-ladspa` |
 | `maxine-denoise` | NVIDIA Maxine Denoiser | LADSPA (GPU) | no | Optional; `gpu: true`, with an install/runtime hint |
 
-A new state starts with RNNoise in the chain. High-pass, noise gate,
-DeepFilterNet, and Maxine are added from the popup or `wavemix fx add`.
+When the RNNoise LADSPA plugin is available, a new state starts with RNNoise
+in the chain. If it is not available, the default chain is empty until you add
+an available effect. High-pass, noise gate, DeepFilterNet, and Maxine are added
+from the popup or `wavemix fx add`.
 
 ### GPU and neural effects
 
@@ -249,9 +255,15 @@ their runtimes, models, or DSP code.
   real-time glitches. That tuning belongs in a separate PipeWire drop-in and is
   not managed by Wavemix.
 
-When the plugin or runtime is missing, the manifest stays in the Add-effect
-list with its `requires` hint and cannot be added. Re-run `wavemix fx plugins`
-to re-check availability after installing a plugin.
+When Wavemix cannot find the LADSPA `.so` file, the manifest stays in the
+Add-effect list with its `requires` hint and cannot be added. Wavemix only
+checks that the file exists; it does not detect whether the Maxine runtime,
+DeepFilterNet models, or other provider dependencies are installed. A wrapper
+that is present but whose runtime is missing can therefore appear available
+and then fail to process audio. Check the PipeWire journal for load or DSP
+errors and confirm the vendor runtime is installed when a neural effect does
+not work. Re-run `wavemix fx plugins` to re-check file availability after
+installing a plugin.
 
 ## Versioning and compatibility
 

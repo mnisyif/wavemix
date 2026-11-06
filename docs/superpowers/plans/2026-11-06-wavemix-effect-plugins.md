@@ -255,7 +255,7 @@ Expected: FAIL with `AttributeError: module 'wavemix_fx' has no attribute 'norma
 Implementation rules:
 
 - `FxError` carries a human-readable message.
-- `normalize_manifest` validates required fields, id/control-key slugs, version/minWavemix, type, ranges (`min <= max`, `step > 0`, `scale > 0`), and non-empty input/output.
+- `normalize_manifest` validates required fields, id/control-key slugs (manifest ids allow hyphens, e.g. `maxine-denoise`), version/minWavemix, type, ranges (`min <= max`, `step > 0`, `scale > 0`), and non-empty input/output.
 - LADSPA availability checks the expanded plugin path with `Path.is_file()`. Builtin is always available. LV2 is available if `lv2_uris is None` or the URI is in the set.
 - Invalid manifests return a normalized entry with `available: false`, `error: "<reason>"`, and a synthetic id derived from the filename when `id` is unavailable.
 - `discover_manifests` sorts files by name, collects bundled then user manifests, replaces bundled entries with valid user entries of the same id, and keeps invalid user entries as separate error rows.

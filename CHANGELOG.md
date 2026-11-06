@@ -10,9 +10,10 @@
 - Live effect controls: sliders and `wavemix fx set` update the running
   filter-chain node through `pw-cli` without restarting PipeWire.
 - Bundled effect manifests at `~/.local/share/wavemix/plugins/`: RNNoise
-  (default), high-pass, noise gate, DeepFilterNet, and NVIDIA Maxine. The
-  neural denoisers stay visible with an install hint when their LADSPA plugin
-  is missing.
+  (default when its LADSPA plugin is available), high-pass, noise gate,
+  DeepFilterNet, and NVIDIA Maxine. The neural denoisers stay visible with an
+  install hint when their LADSPA file is missing; Wavemix does not verify the
+  provider runtime or models.
 - User manifests in `~/.config/wavemix/plugins/`, with bundled-id override
   precedence.
 - Multiple hardware outputs. The mixer's **Also play to** list duplicates the

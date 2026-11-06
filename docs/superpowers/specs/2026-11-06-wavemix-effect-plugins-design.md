@@ -230,7 +230,7 @@ Field rules:
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Lowercase slug: `[a-z0-9_]+`. Unique across bundled + user manifests. |
+| `id` | Lowercase slug: `[a-z0-9_-]+` (hyphens are allowed, e.g. `maxine-denoise`). Unique across bundled + user manifests. |
 | `version` | Plugin definition version, numeric `MAJOR.MINOR.PATCH`. |
 | `minWavemix` | Minimum core version; defaults to `1.1.0`. |
 | `type` | `ladspa`, `lv2`, or `builtin`. |
