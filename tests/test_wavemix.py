@@ -1,7 +1,10 @@
 import importlib.machinery
 import importlib.util
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +38,154 @@ class VersionTests(unittest.TestCase):
       [sys.executable, str(ROOT / "bin" / "wavemix"), "--version"],
       capture_output=True, text=True, check=True)
     self.assertEqual(out.stdout.strip(), f"wavemix {wavemix_fx.WAVEMIX_VERSION}")
+
+
+def manifest_data(ident, version="1.0.0", **overrides):
+  data = {
+    "schemaVersion": 1, "id": ident, "version": version,
+    "name": ident.title(), "type": "builtin", "label": "noisegate",
+    "input": "In", "output": "Out", "controls": [],
+  }
+  data.update(overrides)
+  return data
+
+
+class ManifestTests(unittest.TestCase):
+  def test_valid_manifest_normalizes_defaults(self):
+    data = {
+      "schemaVersion": 1, "id": "demo", "version": "1.0.0",
+      "name": "Demo", "type": "builtin", "label": "bq_highpass",
+      "input": "In", "output": "Out", "controls": [],
+    }
+    manifest = wavemix_fx.normalize_manifest(
+      data, source="bundled", path=Path("/tmp/demo.json"),
+      version="1.1.0")
+    self.assertTrue(manifest["available"])
+    self.assertIsNone(manifest["error"])
+    self.assertEqual(manifest["allowMultiple"], True)
+    self.assertEqual(manifest["source"], "bundled")
+
+  def test_incompatible_min_wavemix_is_unavailable(self):
+    data = {
+      "schemaVersion": 1, "id": "future", "version": "1.0.0",
+      "minWavemix": "9.0.0", "name": "Future", "type": "builtin",
+      "label": "noisegate", "input": "In", "output": "Out", "controls": [],
+    }
+    manifest = wavemix_fx.normalize_manifest(
+      data, source="user", path=Path("/tmp/future.json"),
+      version="1.1.0")
+    self.assertFalse(manifest["available"])
+    self.assertIn("9.0.0", manifest["error"])
+
+  def test_missing_ladspa_file_is_unavailable(self):
+    data = {
+      "schemaVersion": 1, "id": "missing", "version": "1.0.0",
+      "name": "Missing", "type": "ladspa", "plugin": "/no/such/plugin.so",
+      "label": "missing", "input": "In", "output": "Out",
+      "requires": "Install the missing plugin", "controls": [],
+    }
+    manifest = wavemix_fx.normalize_manifest(
+      data, source="user", path=Path("/tmp/missing.json"),
+      version="1.1.0")
+    self.assertFalse(manifest["available"])
+    self.assertEqual(manifest["requires"], "Install the missing plugin")
+
+  def test_user_manifest_overrides_bundled_by_id(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      bundled = root / "bundled"
+      user = root / "user"
+      bundled.mkdir()
+      user.mkdir()
+      (bundled / "demo.json").write_text(
+        json.dumps(manifest_data("demo", "1.0.0")), encoding="utf-8")
+      (user / "demo.json").write_text(
+        json.dumps(manifest_data("demo", "2.0.0")), encoding="utf-8")
+
+      manifests = wavemix_fx.discover_manifests(bundled, user, "1.1.0")
+
+      self.assertEqual(manifests["demo"]["version"], "2.0.0")
+      self.assertEqual(manifests["demo"]["source"], "user")
+
+  def test_invalid_user_manifest_is_kept_as_an_error_row(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      bundled = root / "bundled"
+      user = root / "user"
+      bundled.mkdir()
+      user.mkdir()
+      (bundled / "demo.json").write_text(
+        json.dumps(manifest_data("demo", "1.0.0")), encoding="utf-8")
+      broken = manifest_data("demo", "2.0.0", controls=[{
+        "key": "freq", "param": "Freq", "label": "Freq",
+        "min": 10, "max": 1, "step": 1, "default": 5,
+      }])
+      (user / "demo.json").write_text(json.dumps(broken), encoding="utf-8")
+
+      manifests = wavemix_fx.discover_manifests(bundled, user, "1.1.0")
+
+      self.assertEqual(manifests["demo"]["source"], "bundled")
+      user_rows = [m for m in manifests.values() if m["source"] == "user"]
+      self.assertEqual(len(user_rows), 1)
+      self.assertFalse(user_rows[0]["available"])
+      self.assertIn("range", user_rows[0]["error"])
+
+  def test_bundled_manifests_validate_and_rnnoise_is_default(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      manifests = wavemix_fx.discover_manifests(
+        ROOT / "plugins", Path(tmp) / "user", "1.1.0")
+
+    expected = {"rnnoise", "highpass", "noisegate",
+                "deepfilternet", "maxine-denoise"}
+    self.assertEqual(set(manifests), expected)
+    for ident in expected:
+      manifest = manifests[ident]
+      self.assertEqual(manifest["id"], ident)
+      self.assertEqual(manifest["schemaVersion"], 1)
+      self.assertEqual(manifest["source"], "bundled")
+      self.assertTrue(manifest["available"] or manifest["error"])
+    self.assertTrue(manifests["rnnoise"]["default"])
+    self.assertEqual(
+      {control["key"] for control in manifests["rnnoise"]["controls"]},
+      {"vadThreshold", "vadGrace", "retroactiveGrace", "dryMix"})
+    self.assertEqual(manifests["highpass"]["label"], "bq_highpass")
+
+  def test_missing_maxine_ladspa_is_unavailable_but_listed(self):
+    with tempfile.TemporaryDirectory() as tmp, \
+         patch.dict(os.environ, {"HOME": tmp}):
+      manifests = wavemix_fx.discover_manifests(
+        ROOT / "plugins", Path(tmp) / "user", "1.1.0")
+      maxine = manifests["maxine-denoise"]
+
+      self.assertFalse(maxine["available"])
+      self.assertTrue(maxine["plugin"].startswith(tmp))
+      self.assertIn("broadcast-maxine-ladspa", maxine["requires"])
+      rows = {row["id"]: row for row in wavemix_fx.plugin_list(manifests)}
+      self.assertIn("maxine-denoise", rows)
+      self.assertFalse(rows["maxine-denoise"]["available"])
+
+  def test_manifest_defaults_returns_display_defaults(self):
+    manifest = wavemix_fx.normalize_manifest(
+      manifest_data("demo", controls=[
+        {"key": "freq", "param": "Freq", "min": 20, "max": 500,
+         "step": 5, "default": 80},
+        {"key": "q", "param": "Q", "min": 0.1, "max": 5,
+         "step": 0.1, "default": 0.707},
+      ]), source="bundled", path=Path("/tmp/demo.json"), version="1.1.0")
+
+    self.assertEqual(wavemix_fx.manifest_defaults(manifest),
+                     {"freq": 80, "q": 0.707})
+
+  def test_plugin_list_has_stable_fields(self):
+    manifest = wavemix_fx.normalize_manifest(
+      manifest_data("demo"), source="bundled",
+      path=Path("/tmp/demo.json"), version="1.1.0")
+
+    row = wavemix_fx.plugin_list({"demo": manifest})[0]
+
+    self.assertEqual(set(row), {
+      "id", "name", "description", "version", "schemaVersion", "minWavemix",
+      "source", "available", "gpu", "requires", "error"})
 
 
 PW_CLI_PROPS = """

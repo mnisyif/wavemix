@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "highpass",
+  "version": "1.0.0",
+  "minWavemix": "1.1.0",
+  "name": "High-pass",
+  "description": "Second-order Butterworth high-pass filter",
+  "type": "builtin",
+  "label": "bq_highpass",
+  "input": "In",
+  "output": "Out",
+  "config": {},
+  "gpu": false,
+  "requires": "",
+  "default": false,
+  "allowMultiple": true,
+  "controls": [
+    {
+      "key": "freq",
+      "param": "Freq",
+      "label": "Freq",
+      "min": 20,
+      "max": 500,
+      "step": 5,
+      "unit": " Hz",
+      "default": 80,
+      "integer": true,
+      "raw_float": false,
+      "scale": 1
+    },
+    {
+      "key": "q",
+      "param": "Q",
+      "label": "Q",
+      "min": 0.1,
+      "max": 5,
+      "step": 0.1,
+      "unit": "",
+      "default": 0.707,
+      "integer": false,
+      "raw_float": false,
+      "scale": 1
+    }
+  ]
+}

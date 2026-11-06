@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "maxine-denoise",
+  "version": "1.0.0",
+  "minWavemix": "1.1.0",
+  "name": "NVIDIA Maxine Denoiser",
+  "description": "NVIDIA Maxine GPU-accelerated noise suppression",
+  "type": "ladspa",
+  "plugin": "~/.local/lib/ladspa/libmaxine_ladspa.so",
+  "label": "maxine_denoiser_mono",
+  "input": "Input L",
+  "output": "Output L",
+  "config": {},
+  "gpu": true,
+  "requires": "Install broadcast-maxine-ladspa and the NVIDIA Maxine runtime; add ~/.local/lib/ladspa to LADSPA_PATH if needed",
+  "default": false,
+  "allowMultiple": true,
+  "controls": [
+    {
+      "key": "intensity",
+      "param": "Intensity",
+      "label": "Intensity",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "unit": "",
+      "default": 1.0,
+      "integer": false,
+      "raw_float": false,
+      "scale": 1
+    }
+  ]
+}

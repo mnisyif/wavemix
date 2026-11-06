@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "rnnoise",
+  "version": "1.0.0",
+  "minWavemix": "1.1.0",
+  "name": "RNNoise",
+  "description": "RNN noise suppression with a VAD gate",
+  "type": "ladspa",
+  "plugin": "/usr/lib/ladspa/librnnoise_ladspa.so",
+  "label": "noise_suppressor_mono",
+  "input": "Input",
+  "output": "Output",
+  "config": {},
+  "gpu": false,
+  "requires": "",
+  "default": true,
+  "allowMultiple": true,
+  "controls": [
+    {
+      "key": "vadThreshold",
+      "param": "VAD Threshold (%)",
+      "label": "VAD threshold",
+      "min": 0,
+      "max": 99,
+      "step": 1,
+      "unit": "%",
+      "default": 50,
+      "integer": true,
+      "raw_float": false,
+      "scale": 1
+    },
+    {
+      "key": "vadGrace",
+      "param": "VAD Grace Period (ms)",
+      "label": "VAD grace",
+      "min": 0,
+      "max": 1000,
+      "step": 10,
+      "unit": " ms",
+      "default": 200,
+      "integer": true,
+      "raw_float": false,
+      "scale": 1
+    },
+    {
+      "key": "retroactiveGrace",
+      "param": "Retroactive VAD Grace (ms)",
+      "label": "Retroactive grace",
+      "min": 0,
+      "max": 200,
+      "step": 5,
+      "unit": " ms",
+      "default": 0,
+      "integer": true,
+      "raw_float": false,
+      "scale": 1
+    },
+    {
+      "key": "dryMix",
+      "param": "Dry Mix",
+      "label": "Dry mix",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": "%",
+      "default": 0,
+      "integer": true,
+      "raw_float": true,
+      "scale": 100
+    }
+  ]
+}

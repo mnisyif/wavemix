@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "deepfilternet",
+  "version": "1.0.0",
+  "minWavemix": "1.1.0",
+  "name": "DeepFilterNet",
+  "description": "DeepFilterNet speech enhancement",
+  "type": "ladspa",
+  "plugin": "/usr/lib/ladspa/libdeep_filter_ladspa.so",
+  "label": "deep_filter_mono",
+  "input": "Audio In",
+  "output": "Audio Out",
+  "config": {},
+  "gpu": false,
+  "requires": "Install deepfilternet-ladspa",
+  "default": false,
+  "allowMultiple": true,
+  "controls": [
+    {
+      "key": "attenuationLimit",
+      "param": "Attenuation Limit (dB)",
+      "label": "Attenuation Limit (dB)",
+      "min": 0,
+      "max": 100,
+      "step": 1,
+      "unit": " dB",
+      "default": 100,
+      "integer": true,
+      "raw_float": false,
+      "scale": 1
+    }
+  ]
+}
