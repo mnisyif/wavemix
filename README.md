@@ -68,6 +68,9 @@ panel:
 - `Enter` toggle a send, mute, or dropdown
 - `Esc` close
 
+Middle-click either bar icon, or click the gear beside **Noise suppression**, to
+open the RNNoise settings popup.
+
 The thin bar under each channel name is its live level meter. It reads the
 channel's audio before the send faders, so it reacts to the channel itself, not
 to the send level.
@@ -84,6 +87,10 @@ wavemix send browser output on
 wavemix channel add "Podcasts"
 wavemix route firefox podcasts
 wavemix device output <sink-name>
+
+wavemix micfx on
+wavemix micfx controls --json
+wavemix micfx set vadThreshold 60
 ```
 
 Run `wavemix --help` for the full list.
@@ -104,6 +111,33 @@ The fragment in `extras/` expects the plugin at
 `/usr/lib/ladspa/librnnoise_ladspa.so`; adjust the path if your package puts it
 elsewhere.
 
+### Noise-canceller controls
+
+Middle-click either Wavemix icon, or click the gear on the **Noise suppression**
+row, to open the RNNoise settings popup. It exposes the live filter-chain
+controls:
+
+| Control | Range |
+| --- | --- |
+| VAD threshold | 0–99 % |
+| VAD grace period | 0–1000 ms |
+| Retroactive VAD grace | 0–200 ms |
+| Dry mix | 0–100 % |
+
+Changes apply immediately through `pw-cli set-param`; PipeWire does not need to
+restart. Values are stored under `micFx.controls` in
+`~/.config/wavemix/state.json` and reapplied by `wavemix up` after a graph
+rebuild or PipeWire restart.
+
+The same controls are available from the CLI:
+
+```sh
+wavemix micfx controls            # human-readable live values
+wavemix micfx controls --json     # values plus ranges for the panel
+wavemix micfx set vadThreshold 60
+wavemix micfx set dryMix 25
+```
+
 ## Repository layout
 
 ```
@@ -112,7 +146,14 @@ plugin/manifest.json            Omarchy bar-widget manifest
 plugin/Panel.qml                Bar widget and mixer panel (live meters)
 systemd/wavemix.service         User service that keeps the graph reconciled
 extras/90-wavemix-micfx.conf    Optional RNNoise filter-chain fragment
+tests/test_wavemix.py           Unit tests for the mic FX control handling
 install.sh                      Installer
+```
+
+Run the tests with:
+
+```sh
+python3 -m unittest discover -s tests
 ```
 
 ## Uninstall
