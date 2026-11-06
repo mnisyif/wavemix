@@ -62,6 +62,9 @@ Panel {
   property string view: "main" // "main" | "pick"
   property string pickChannel: ""
   property bool editing: false
+  // Short-lived feedback for the multi-output picker (the last output cannot
+  // be removed, so the click is refused rather than sent to the CLI).
+  property string outputNotice: ""
 
   // RNNoise settings popup. fxData is the JSON from `wavemix micfx controls`.
   property bool fxOpen: false
@@ -161,6 +164,60 @@ Panel {
   function openDeviceDropdown(key) {
     var d = dropdownFor(key)
     if (d) d.toggle()
+  }
+  // ---- multi-output --------------------------------------------------------
+  // selected.outputs may still hold the @DEFAULT_SINK@ sentinel (a migrated
+  // default state). Resolve it to the concrete primary so the picker checks
+  // the output the engine is actually playing through.
+  function resolveOutputName(name) {
+    var n = String(name || "")
+    if (n === "" || n === "@DEFAULT_SINK@") return deviceCurrent("output")
+    return n
+  }
+  function deviceSelectedOutputs() {
+    var primary = deviceCurrent("output")
+    var raw = (devicesData && devicesData.selected) ? devicesData.selected.outputs : null
+    var out = []
+    if (!raw || typeof raw.length !== "number") {
+      if (primary !== "") out.push(primary)
+      return out
+    }
+    for (var i = 0; i < raw.length; i++) {
+      var name = resolveOutputName(raw[i])
+      if (name !== "" && out.indexOf(name) === -1) out.push(name)
+    }
+    if (out.length === 0 && primary !== "") out.push(primary)
+    return out
+  }
+  function outputIsSelected(name) {
+    return deviceSelectedOutputs().indexOf(String(name || "")) !== -1
+  }
+  function additionalOutputs() {
+    var primary = deviceCurrent("output")
+    var list = deviceList("output")
+    var out = []
+    for (var i = 0; i < list.length; i++)
+      if (String(list[i].name) !== primary) out.push(list[i])
+    return out
+  }
+  function showOutputNotice(message) {
+    root.outputNotice = String(message)
+    outputNoticeTimer.restart()
+  }
+  function toggleOutput(name) {
+    var target = String(name || "")
+    if (target === "") return
+    if (root.outputIsSelected(target)) {
+      if (root.deviceSelectedOutputs().length <= 1) {
+        root.showOutputNotice("Keep at least one output selected.")
+        return
+      }
+      run(["device", "output-remove", target])
+    } else {
+      run(["device", "output-add", target])
+    }
+    root.outputNotice = ""
+    refreshSoon()
   }
 
   readonly property bool dropdownOpen: ddOutput.popupOpen || ddInput.popupOpen
@@ -382,6 +439,7 @@ Panel {
       view = "main"
       cursorIndex = 0
       editing = false
+      outputNotice = ""
       refresh()
       refreshDevices()
     }
@@ -462,6 +520,13 @@ Panel {
     interval: 250
     repeat: false
     onTriggered: { root.refresh(); root.refreshDevices(); root.refreshMutes() }
+  }
+
+  Timer {
+    id: outputNoticeTimer
+    interval: 4000
+    repeat: false
+    onTriggered: root.outputNotice = ""
   }
 
   Timer {
@@ -757,6 +822,45 @@ Panel {
               onChanged: function(v) { root.setDevice("output", v) }
             }
 
+            PanelSectionHeader {
+              text: "Also play to"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              visible: root.additionalOutputs().length === 0
+              text: root.devicesData ? "No other outputs connected." : "Loading…"
+              textFormat: Text.PlainText
+              color: Qt.darker(root.foreground, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Repeater {
+              model: root.additionalOutputs()
+
+              OutputCheckRow {
+                required property var modelData
+                width: parent.width
+                outputName: String(modelData.name)
+                outputDescription: String(modelData.description)
+                checked: root.outputIsSelected(modelData.name)
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.outputNotice !== ""
+              text: root.outputNotice
+              textFormat: Text.PlainText
+              color: Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
             Dropdown {
               id: ddInput
               width: parent.width
@@ -1026,6 +1130,8 @@ Panel {
   component CheckBox: Item {
     id: box
     property bool checked: false
+    // Off when the surrounding row owns the click (the Also play to rows).
+    property bool interactive: true
     signal toggled()
 
     implicitWidth: Style.space(16)
@@ -1050,8 +1156,52 @@ Panel {
 
     MouseArea {
       anchors.fill: parent
+      enabled: box.interactive
       cursorShape: Qt.PointingHandCursor
       onClicked: box.toggled()
+    }
+  }
+
+  component OutputCheckRow: Item {
+    id: outRow
+    property string outputName: ""
+    property string outputDescription: ""
+    property bool checked: false
+
+    implicitHeight: outLabel.implicitHeight + Style.space(8)
+
+    Row {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      CheckBox {
+        anchors.verticalCenter: parent.verticalCenter
+        checked: outRow.checked
+        interactive: false
+      }
+
+      Text {
+        id: outLabel
+        width: parent.width - Style.space(16) - parent.spacing
+        anchors.verticalCenter: parent.verticalCenter
+        text: outRow.outputDescription !== "" ? outRow.outputDescription : outRow.outputName
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.toggleOutput(outRow.outputName)
     }
   }
 
@@ -1126,6 +1276,10 @@ Panel {
 
     readonly property bool on: root.sendOn(channelId, sendName)
     readonly property int volume: root.sendVol(channelId, sendName)
+    readonly property int outputCount: root.deviceSelectedOutputs().length
+    readonly property string sendLabel: sendName === "output"
+      ? (outputCount > 1 ? "out ×" + outputCount : "out")
+      : "stream"
 
     hasCursor: root.view === "main" && root.cursorIndex === controlIndex
     foreground: root.foreground
@@ -1148,7 +1302,8 @@ Panel {
       Text {
         width: Style.space(46)
         anchors.verticalCenter: parent.verticalCenter
-        text: row.sendName === "output" ? "out" : "stream"
+        text: row.sendLabel
+        textFormat: Text.PlainText
         color: row.on ? root.foreground : Qt.darker(root.foreground, 1.7)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
