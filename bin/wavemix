@@ -374,6 +374,66 @@ def set_mic_fx_playback_link() -> None:
       _pwlink(out, inp)
 
 
+def _pw_link_pairs() -> set[tuple[str, str]]:
+  """Directed (source, target) port pairs from `pw-link -l`."""
+  pairs: set[tuple[str, str]] = set()
+  source = ""
+  for line in sh("pw-link", "-l").splitlines():
+    if not line.strip():
+      continue
+    if line[:1].isspace():
+      match = re.match(r"\s+\|(->|<-)\s+(\S+)", line)
+      if not match or not source:
+        continue
+      other = match.group(2)
+      if match.group(1) == "->":
+        pairs.add((source, other))
+      else:
+        pairs.add((other, source))
+      continue
+    source = line.strip()
+  return pairs
+
+
+def _pw_ports(flag: str) -> list[str]:
+  """Port names from `pw-link -o` or `pw-link -i`."""
+  return [line.strip() for line in sh("pw-link", flag).splitlines()
+          if line.strip()]
+
+
+def fx_links_present(raw_mic: str) -> bool:
+  """Whether the loaded chain is fed by the mic and feeds every mic-bus input."""
+  pairs = _pw_link_pairs()
+  outputs = _pw_ports("-o")
+  inputs = _pw_ports("-i")
+  raw_outs = [port for port in outputs if port.startswith(raw_mic + ":")]
+  capture_ins = [port for port in inputs
+                 if port.startswith(MICFX_CAPTURE + ":")]
+  if not any((source, target) in pairs
+             for source in raw_outs for target in capture_ins):
+    return False
+  playback_outs = [port for port in outputs
+                   if port.startswith(MICFX_SOURCE + ":")]
+  micbus_ins = [port for port in inputs
+                if port.startswith(MIC_BUS + ":playback_")]
+  if not playback_outs or not micbus_ins:
+    return False
+  return all(any((output, target) in pairs for output in playback_outs)
+             for target in micbus_ins)
+
+
+def fx_chain_active(state: dict, manifests: dict[str, dict],
+                    capture_id: int | None = None) -> bool:
+  """Whether the master is on and a loaded, non-empty chain can carry audio."""
+  if not mic_fx_enabled(state):
+    return False
+  if not fx.enabled_instances(state, manifests):
+    return False
+  if capture_id is None:
+    capture_id = fx.find_capture_node_id(sh)
+  return capture_id is not None
+
+
 def channel_capture(channel: dict, devices: dict, mic: str) -> str | None:
   if channel.get("source") == "mic":
     return mic
@@ -558,25 +618,30 @@ def up(state: dict) -> None:
   # Self-heal a stored device that points at a bus or a vanished device.
   if sanitize_devices(state):
     save_state(state)
-  unload_all()
-  ensure_buses()
-  ensure_defaults(state)
-  # Rewrite the generated chain on every rebuild so the live graph, the state
-  # file, and the plugin manifests can never drift apart.
+  # Rewrite the generated chain before tearing anything down so a render error
+  # leaves the live graph intact. The chain is compiled from the enabled
+  # effects whether or not the master switch is on; only routing follows it.
   manifests = fx.discover_manifests(
     fx.bundled_dir(), fx.user_dir(), fx.WAVEMIX_VERSION)
   fx.render_to_disk(state, manifests, fx.WAVEMIX_VERSION)
-  mic = mic_source(state)
+  unload_all()
+  ensure_buses()
+  ensure_defaults(state)
   raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
-  if mic_fx_enabled(state):
+  capture_id = fx.find_capture_node_id(sh)
+  if fx_chain_active(state, manifests, capture_id):
     # The filter-chain feeds the mic bus; wire the mic into the chain explicitly.
+    mic = mic_source(state)
     set_mic_fx_link(raw_mic, True)
     set_mic_fx_playback_link()
   else:
+    # Master off, empty/all-disabled/all-unavailable chain, or a missing live
+    # chain node: never leave the mic bus without an input. Feed it, and route
+    # channel sends, from the raw hardware mic - not micbus.monitor into itself.
+    mic = raw_mic
     set_mic_fx_link(raw_mic, False)
-    ensure_mic_bus_feed(mic)
-  fx.apply_chain_controls(
-    sh, fx.find_capture_node_id(sh), state, manifests)
+    ensure_mic_bus_feed(raw_mic)
+  fx.apply_chain_controls(sh, capture_id, state, manifests)
   for channel in state["channels"]:
     ensure_channel_sink(channel)
     for send in ("output", "input"):
@@ -613,12 +678,16 @@ def graph_up(state: dict) -> bool:
   if MIC_BUS_SOURCE not in sources or STREAM_BUS_SOURCE not in sources:
     return False
   inputs = sink_inputs()
-  # With mic FX on, the filter chain feeds the mic bus directly and the raw
-  # mic->micbus loopback is deliberately absent. Requiring that loopback in
-  # that mode makes graph_up() always false, so the watcher tears down and
-  # rebuilds the whole graph on every tick (audio dropouts/clipping).
-  if not mic_fx_enabled(state) and not any(
-      (si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG for si in inputs):
+  raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
+  manifests = _fx_manifests() if mic_fx_enabled(state) else {}
+  active = fx_chain_active(state, manifests)
+  if active:
+    # The chain must actually bridge the mic into every mic-bus input.
+    if not fx_links_present(raw_mic):
+      return False
+  elif not any((si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG
+               for si in inputs):
+    # Master off or no usable live chain: the raw mic must feed the mic bus.
     return False
   name = existing_sink_names()
   by_index = {str(s.get("index")): str(s.get("name") or "") for s in sinks()}
@@ -1044,6 +1113,8 @@ def _cmd_fx_add(args, state: dict, manifests: dict[str, dict]) -> None:
     _fx_render(state, manifests)
     _fx_restart_or_fail()
   print(f"wavemix: added {instance['id']}")
+  if not mic_fx_enabled(state):
+    print("wavemix: effects are off; run `wavemix fx enable` to hear them")
 
 
 def _cmd_fx_remove(args, state: dict, manifests: dict[str, dict]) -> None:

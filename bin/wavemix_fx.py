@@ -100,6 +100,35 @@ def _number(value, field: str):
   return value
 
 
+def _validate_config_value(value, field: str) -> None:
+  """Validate a static filter `config` value for SPA rendering.
+
+  A bad value must disable only this manifest: `_spa_value()` would otherwise
+  raise mid-render (None, NaN/inf) and abort the whole chain."""
+  if value is None:
+    raise FxError(f"{field} cannot be null")
+  if isinstance(value, bool) or isinstance(value, str):
+    return
+  if isinstance(value, int):
+    return
+  if isinstance(value, float):
+    if not math.isfinite(value):
+      raise FxError(f"{field} must be finite")
+    return
+  if isinstance(value, (list, tuple)):
+    for index, item in enumerate(value):
+      _validate_config_value(item, f"{field}[{index}]")
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      if not isinstance(key, str) or not key:
+        raise FxError(f"{field} keys must be non-empty strings")
+      _validate_config_value(item, f"{field}.{key}")
+    return
+  raise FxError(
+    f"{field} has unsupported type {type(value).__name__}")
+
+
 def _normalize_control(raw, index: int, seen: set[str]) -> dict:
   if not isinstance(raw, dict):
     raise FxError(f"controls[{index}] must be an object")
@@ -195,6 +224,7 @@ def _validated_manifest(data: dict, source: str, path: Path,
   config = data.get("config", {})
   if not isinstance(config, dict):
     raise FxError("config must be an object")
+  _validate_config_value(config, "config")
 
   input_port = _text(data, "input").strip()
   output_port = _text(data, "output").strip()
@@ -669,9 +699,13 @@ def set_instance_control(state: dict, manifests: dict[str, dict],
 
 
 def enabled_instances(state: dict, manifests: dict[str, dict]) -> list[dict]:
-  """Enabled, available instances in processing order with their fx node."""
+  """Enabled, available instances in processing order with their fx node.
+
+  The master switch is deliberately not consulted: the generated chain is
+  compiled whenever it has effects, so enabling the master can link a chain
+  PipeWire already loaded instead of needing a restart."""
   micfx = state.get("micFx") if isinstance(state, dict) else None
-  if not isinstance(micfx, dict) or not micfx.get("enabled"):
+  if not isinstance(micfx, dict):
     return []
   chain = micfx.get("chain")
   if not isinstance(chain, list):
@@ -932,6 +966,8 @@ def _spa_value(value) -> str:
   if isinstance(value, int):
     return str(value)
   if isinstance(value, float):
+    if not math.isfinite(value):
+      raise FxError(f"cannot render non-finite config value {value!r}")
     return f"{value:.6f}"
   if isinstance(value, (list, tuple)):
     if not value:
@@ -1010,19 +1046,36 @@ def _port(entry: dict, port: str) -> str:
   return f"{entry['node']}:{entry['manifest'].get(port, '')}"
 
 
+def _renderable_entries(entries: list[dict]) -> list[tuple[dict, list[str]]]:
+  """Render each node, dropping one bad instance instead of the whole chain.
+
+  Node names are kept as assigned by `enabled_instances` so live controls and
+  `fx state` still point at the same fxN when a defensively skipped instance
+  leaves a gap."""
+  prepared: list[tuple[dict, list[str]]] = []
+  for entry in entries:
+    try:
+      node_lines = _node_lines(entry)
+    except (FxError, KeyError, TypeError, ValueError):
+      continue
+    prepared.append((entry, node_lines))
+  return prepared
+
+
 def render_config(state: dict, manifests: dict[str, dict],
                   version: str) -> str:
   """Compile the enabled chain into one PipeWire filter-chain fragment."""
-  entries = enabled_instances(state, manifests)
+  prepared = _renderable_entries(enabled_instances(state, manifests))
   names = " -> ".join(
-    str(entry["manifest"].get("id", "?")) for entry in entries) or "empty"
+    str(entry["manifest"].get("id", "?")) for entry, _ in prepared) or "empty"
   core = str(version).replace("\n", " ").replace("\r", " ")
   lines = [GENERATED_MARKER, f"# Core {core}; chain: {names}"]
 
-  if not entries:
+  if not prepared:
     lines.append("# No effects enabled; the microphone uses the raw feed.")
     return "\n".join(lines) + "\n"
 
+  entries = [entry for entry, _ in prepared]
   lines.extend([
     "context.modules = [",
     "  { name = libpipewire-module-filter-chain",
@@ -1032,8 +1085,8 @@ def render_config(state: dict, manifests: dict[str, dict],
     "      filter.graph = {",
     "        nodes = [",
   ])
-  for entry in entries:
-    lines.extend(f"          {line}" for line in _node_lines(entry))
+  for _, node_lines in prepared:
+    lines.extend(f"          {line}" for line in node_lines)
   lines.append("        ]")
 
   if len(entries) > 1:

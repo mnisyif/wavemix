@@ -136,6 +136,13 @@ trigger. Control changes and the master switch do not restart PipeWire. A
 bypassed effect keeps its stored controls but is excluded from the compiled
 chain.
 
+The chain is compiled whenever it has at least one enabled, available effect,
+even while the master switch is off. Enabling the switch then routes the raw
+mic through the already-loaded chain instead of needing an audio restart. An
+empty, all-bypassed, or all-unavailable chain renders no filter-chain module
+and keeps the raw microphone path. If a structural change was never loaded (for
+example after a failed restart), run `wavemix fx apply`.
+
 Unavailable effects stay in the chain as an `unavailable` row, and the selected
 effect's settings show the error and install hint; the rest of the chain keeps
 working. An effect whose manifest version changed keeps its stored controls and
@@ -203,7 +210,7 @@ Required fields are `schemaVersion`, `id`, `version`, `name`, `type`,
 | `plugin` | LADSPA `.so` path or LV2 URI; ignored for builtin. `~` and `$HOME` are expanded |
 | `label` | LADSPA or builtin label; optional for LV2 |
 | `input` / `output` | Mono audio port names, without the node prefix |
-| `config` | Optional static filter config passed to the node |
+| `config` | Optional static filter config passed to the node. Values must be finite numbers, strings, booleans, lists, or maps |
 | `gpu` | UI/CLI GPU badge; does not change compilation |
 | `requires` | Install hint shown when the plugin is unavailable |
 | `default` | Include in the default chain when no chain exists |
@@ -217,7 +224,9 @@ mix uses `scale: 100`).
 
 Validation is per manifest: an invalid, incompatible, or missing plugin is
 listed as unavailable with an error and never compiled. The rest of the chain
-still loads.
+still loads. Invalid static `config` values (null, non-finite numbers, or
+unsupported types) mark only that manifest unavailable; if one instance still
+fails while rendering, it is skipped instead of aborting the chain.
 
 ### Bundled effects
 
@@ -346,8 +355,10 @@ Behavior details:
   the live node with `pw-cli set-param`, and rewrites the config without
   restarting. If the node is not running it still stores the value and reports
   `applied: false`; the value is applied on the next `up()` or restart.
-- `fx enable|disable` rebuild the mic routes without restarting, like the old
-  `micfx` switch. Use `fx apply` after a structural change that failed to load.
+- `fx enable|disable` rebuild the mic routes without restarting. A non-empty
+  chain is compiled and loaded even while the master is off, so enabling links
+  it immediately; if the config was never loaded or a restart failed, use
+  `fx apply`.
 - `fx render` is the non-disruptive path; `fx apply` is the retry path after a
   failed restart.
 

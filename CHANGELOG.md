@@ -37,6 +37,15 @@
   instance.
 - The speaker mute controls every selected output and reads as muted only when
   all of them are muted.
+- The effect chain is compiled whenever it has enabled, available effects, even
+  while the microphone effects master switch is off. Enabling the switch links
+  the already-loaded chain without a PipeWire restart. A master switch with no
+  usable chain (empty, all bypassed, all unavailable, or no live capture node)
+  keeps the raw microphone path instead of silencing the mic bus.
+- Invalid static `config` values now mark only that manifest unavailable, and a
+  single unrenderable instance is skipped instead of aborting the whole chain.
+  Rendering also happens before the old graph is unloaded, so a render failure
+  leaves the existing graph intact.
 - `install.sh` installs `wavemix_fx.py`, replaces the bundled manifest set,
   renders the generated config, and restarts PipeWire only when the config
   changed.

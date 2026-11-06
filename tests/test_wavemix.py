@@ -152,6 +152,36 @@ class ManifestTests(unittest.TestCase):
       self.assertFalse(user_rows[0]["available"])
       self.assertIn("range", user_rows[0]["error"])
 
+  def test_null_config_value_is_unavailable_and_others_stay_available(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      bundled = root / "bundled"
+      user = root / "user"
+      bundled.mkdir()
+      user.mkdir()
+      (bundled / "demo.json").write_text(
+        json.dumps(manifest_data("demo", "1.0.0")), encoding="utf-8")
+      broken = manifest_data("broken", "1.0.0", config={"x": None})
+      (user / "broken.json").write_text(json.dumps(broken), encoding="utf-8")
+
+      manifests = wavemix_fx.discover_manifests(bundled, user, "1.1.0")
+
+      self.assertTrue(manifests["demo"]["available"])
+      self.assertIsNone(manifests["demo"]["error"])
+      self.assertFalse(manifests["broken"]["available"])
+      self.assertIn("config", manifests["broken"]["error"])
+
+  def test_non_finite_and_unsupported_config_values_are_rejected(self):
+    for value, message in ((float("inf"), "finite"),
+                           ({"nested": [None]}, "nested[0]"),
+                           (object(), "unsupported")):
+      with self.subTest(value=value):
+        manifest = wavemix_fx.normalize_manifest(
+          manifest_data("bad", config={"x": value}),
+          source="user", path=Path("/tmp/bad.json"), version="1.1.0")
+        self.assertFalse(manifest["available"])
+        self.assertIn(message, manifest["error"])
+
   def test_bundled_manifests_validate_and_rnnoise_is_default(self):
     with tempfile.TemporaryDirectory() as tmp:
       manifests = wavemix_fx.discover_manifests(
@@ -408,6 +438,37 @@ class CompilerTests(unittest.TestCase):
     self.assertNotIn("name = fx1", text)
     self.assertNotIn("rnnoise", text)
     self.assertNotIn("missing", text)
+
+  def test_master_off_still_compiles_a_non_empty_chain(self):
+    state = {"version": 2, "micFx": {"enabled": False, "chain": [
+      {"id": "highpass-1", "plugin": "highpass", "enabled": True,
+       "controls": {}}]}}
+    text = wavemix_fx.render_config(state, self.manifests, "1.1.0")
+    self.assertIn("libpipewire-module-filter-chain", text)
+    self.assertIn("name = fx0", text)
+
+  def test_master_off_empty_chain_renders_no_module(self):
+    state = {"version": 2, "micFx": {"enabled": False, "chain": []}}
+    text = wavemix_fx.render_config(state, self.manifests, "1.1.0")
+    self.assertNotIn("libpipewire-module-filter-chain", text)
+
+  def test_unrenderable_instance_is_skipped(self):
+    broken = dict(self.manifests["highpass"])
+    broken["config"] = {"x": None}
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "broken-1", "plugin": "broken", "enabled": True, "controls": {}},
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {}}]}}
+    manifests = dict(self.manifests, broken=broken)
+
+    text = wavemix_fx.render_config(state, manifests, "1.1.0")
+
+    self.assertIn("libpipewire-module-filter-chain", text)
+    self.assertNotIn("broken", text)
+    self.assertNotIn("name = fx0", text)
+    self.assertIn("name = fx1", text)
+    self.assertIn('inputs = [ "fx1:Input" ]', text)
+    self.assertIn('outputs = [ "fx1:Output" ]', text)
 
   def test_strings_with_spaces_and_punctuation_are_quoted(self):
     text = wavemix_fx.render_config(
@@ -875,6 +936,41 @@ class CliFxTests(unittest.TestCase):
     self.assertIn('"Freq" = 80', text)
     restart.assert_called_once_with()
 
+  def test_fx_add_hints_when_effects_are_off(self):
+    self.write_state(enabled=False, chain=[])
+    output = io.StringIO()
+    with patch.object(wavemix, "restart_audio", Mock(return_value=True)), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(wavemix.main(["fx", "add", "highpass"]), 0)
+
+    text = output.getvalue()
+    self.assertIn("effects are off", text)
+    self.assertIn("wavemix fx enable", text)
+
+  def test_fx_enable_links_an_already_loaded_chain_without_restart(self):
+    self.write_state(enabled=False, chain=[self.rnnoise_instance()])
+    restart = Mock(return_value=True)
+    with patch.object(wavemix, "restart_audio", restart), \
+         patch.object(wavemix, "sanitize_devices", Mock(return_value=False)), \
+         patch.object(wavemix, "unload_all"), \
+         patch.object(wavemix, "ensure_buses"), \
+         patch.object(wavemix, "ensure_defaults"), \
+         patch.object(wavemix, "ensure_mic_bus_feed") as feed, \
+         patch.object(wavemix, "set_mic_fx_link") as link, \
+         patch.object(wavemix, "set_mic_fx_playback_link") as playback, \
+         patch.object(wavemix, "apply_all_sends"), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix.fx, "apply_chain_controls"), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(wavemix.main(["fx", "enable"]), 0)
+
+    link.assert_called_once_with("@DEFAULT_SOURCE@", True)
+    playback.assert_called_once_with()
+    feed.assert_not_called()
+    restart.assert_not_called()
+    self.assertIn("libpipewire-module-filter-chain",
+                  self.config.read_text(encoding="utf-8"))
+
   def test_fx_set_does_not_restart(self):
     self.write_state(enabled=True, chain=[self.rnnoise_instance()])
     restart = Mock(return_value=True)
@@ -1073,6 +1169,98 @@ class UpReapplyTests(unittest.TestCase):
     self.assertEqual(events[1][0], "link")
 
 
+class MicFxRoutingTests(unittest.TestCase):
+  def state(self, chain, enabled=True):
+    return {"version": 2,
+            "devices": {"output": "out", "outputs": ["out"],
+                        "input": "alsa_in"},
+            "channels": [{"id": "mic", "name": "Mic", "source": "mic",
+                          "output": {"on": False, "volume": 50},
+                          "input": {"on": True, "volume": 100}}],
+            "defaults": {}, "rules": {},
+            "micFx": {"enabled": enabled, "chain": chain}}
+
+  def manifests(self, available=True):
+    return {"highpass": {"id": "highpass", "available": available,
+                         "error": None if available else "plugin missing"}}
+
+  def chain(self, enabled=True):
+    return [{"id": "highpass-1", "plugin": "highpass", "enabled": enabled,
+             "controls": {}}]
+
+  def run_up(self, state, manifests, capture=34):
+    names = ("sanitize_devices", "unload_all", "ensure_buses",
+             "ensure_defaults", "set_mic_fx_link",
+             "set_mic_fx_playback_link", "ensure_mic_bus_feed",
+             "ensure_channel_sink", "ensure_send", "apply_all_sends")
+    mocks = {name: Mock() for name in names}
+    mocks["sanitize_devices"].return_value = False
+    with patch.multiple(wavemix, **mocks), \
+        patch.object(wavemix.fx, "find_capture_node_id",
+                     return_value=capture), \
+        patch.object(wavemix.fx, "discover_manifests",
+                     return_value=manifests), \
+        patch.object(wavemix.fx, "render_to_disk"), \
+        patch.object(wavemix.fx, "apply_chain_controls"):
+      wavemix.up(state)
+    return mocks
+
+  def assert_raw_path(self, mocks):
+    mocks["set_mic_fx_link"].assert_called_once_with("alsa_in", False)
+    mocks["ensure_mic_bus_feed"].assert_called_once_with("alsa_in")
+    mocks["set_mic_fx_playback_link"].assert_not_called()
+    for call in mocks["ensure_send"].call_args_list:
+      self.assertEqual(call.args[3], "alsa_in")
+
+  def test_master_on_empty_chain_uses_raw_mic(self):
+    mocks = self.run_up(self.state([]), self.manifests())
+    self.assert_raw_path(mocks)
+
+  def test_master_on_all_bypassed_uses_raw_mic(self):
+    mocks = self.run_up(self.state(self.chain(enabled=False)),
+                        self.manifests())
+    self.assert_raw_path(mocks)
+
+  def test_master_on_all_unavailable_uses_raw_mic(self):
+    mocks = self.run_up(self.state(self.chain()),
+                        self.manifests(available=False))
+    self.assert_raw_path(mocks)
+
+  def test_master_on_missing_capture_node_uses_raw_mic(self):
+    mocks = self.run_up(self.state(self.chain()), self.manifests(),
+                        capture=None)
+    self.assert_raw_path(mocks)
+
+  def test_master_off_with_a_chain_uses_raw_mic(self):
+    mocks = self.run_up(self.state(self.chain(), enabled=False),
+                        self.manifests())
+    self.assert_raw_path(mocks)
+
+  def test_master_on_active_chain_routes_through_fx(self):
+    mocks = self.run_up(self.state(self.chain()), self.manifests())
+    mocks["set_mic_fx_link"].assert_called_once_with("alsa_in", True)
+    mocks["set_mic_fx_playback_link"].assert_called_once_with()
+    mocks["ensure_mic_bus_feed"].assert_not_called()
+    for call in mocks["ensure_send"].call_args_list:
+      self.assertEqual(call.args[3], wavemix.MIC_BUS + ".monitor")
+
+  def test_up_render_error_leaves_the_existing_graph_intact(self):
+    state = self.state(self.chain())
+    mocks = {name: Mock() for name in
+             ("sanitize_devices", "unload_all", "ensure_buses",
+              "ensure_defaults")}
+    mocks["sanitize_devices"].return_value = False
+    with patch.multiple(wavemix, **mocks), \
+        patch.object(wavemix.fx, "discover_manifests", return_value={}), \
+        patch.object(wavemix.fx, "render_to_disk",
+                     side_effect=wavemix.fx.FxError("bad config")):
+      with self.assertRaises(wavemix.fx.FxError):
+        wavemix.up(state)
+
+    mocks["unload_all"].assert_not_called()
+    mocks["ensure_buses"].assert_not_called()
+
+
 class MultiOutputGraphTests(unittest.TestCase):
   def hardware(self, *names):
     return [{"name": name, "properties": {"device.api": "alsa"}} for name in names]
@@ -1145,6 +1333,82 @@ class MultiOutputGraphTests(unittest.TestCase):
          patch.object(wavemix, "sink_inputs",
                       return_value=[si for si in inputs if si["sink"] != 11]):
       self.assertFalse(wavemix.graph_up(state))
+
+  def test_graph_up_requires_raw_feed_when_the_chain_is_inactive(self):
+    state = {"devices": {"output": "a", "outputs": ["a"], "input": "mic"},
+             "channels": [],
+             "micFx": {"enabled": True, "chain": []}}
+    with patch.object(wavemix, "existing_source_names",
+                      return_value={wavemix.MIC_BUS_SOURCE,
+                                    wavemix.STREAM_BUS_SOURCE}), \
+         patch.object(wavemix, "existing_sink_names", return_value=set()), \
+         patch.object(wavemix, "sink_inputs", return_value=[]), \
+         patch.object(wavemix, "_fx_manifests", return_value={}):
+      self.assertFalse(wavemix.graph_up(state))
+
+    feed = self.stream(1, wavemix.MICBUS_TAG, 99)
+    with patch.object(wavemix, "existing_source_names",
+                      return_value={wavemix.MIC_BUS_SOURCE,
+                                    wavemix.STREAM_BUS_SOURCE}), \
+         patch.object(wavemix, "existing_sink_names", return_value=set()), \
+         patch.object(wavemix, "sink_inputs", return_value=[feed]), \
+         patch.object(wavemix, "_fx_manifests", return_value={}):
+      self.assertTrue(wavemix.graph_up(state))
+
+  def test_graph_up_requires_fx_links_when_the_chain_is_active(self):
+    state = {"devices": {"output": "a", "outputs": ["a"], "input": "mic"},
+             "channels": [],
+             "micFx": {"enabled": True, "chain": [{
+               "id": "highpass-1", "plugin": "highpass",
+               "enabled": True, "controls": {},
+             }]}}
+    manifests = {"highpass": {"available": True, "error": None}}
+    for links, expected in ((False, False), (True, True)):
+      with self.subTest(links=links), \
+           patch.object(wavemix, "existing_source_names",
+                        return_value={wavemix.MIC_BUS_SOURCE,
+                                      wavemix.STREAM_BUS_SOURCE}), \
+           patch.object(wavemix, "existing_sink_names", return_value=set()), \
+           patch.object(wavemix, "sink_inputs", return_value=[]), \
+           patch.object(wavemix, "_fx_manifests", return_value=manifests), \
+           patch.object(wavemix.fx, "find_capture_node_id",
+                        return_value=34), \
+           patch.object(wavemix, "fx_links_present", return_value=links):
+        self.assertIs(wavemix.graph_up(state), expected)
+
+  def test_fx_links_present_checks_capture_and_playback(self):
+    text = (
+      "wavemix_micfx.capture:input_MONO\n"
+      "  |<- mic:capture_MONO\n"
+      "wavemix_micfx:output_MONO\n"
+      "  |-> wavemix_micbus:playback_FL\n"
+      "  |-> wavemix_micbus:playback_FR\n"
+    )
+    outputs = "mic:capture_MONO\nwavemix_micfx:output_MONO\n"
+    inputs = ("wavemix_micfx.capture:input_MONO\n"
+              "wavemix_micbus:playback_FL\n"
+              "wavemix_micbus:playback_FR\n")
+
+    def fake_sh(*args):
+      return {"-l": text, "-o": outputs, "-i": inputs}.get(args[-1], "")
+
+    with patch.object(wavemix, "sh", side_effect=fake_sh):
+      self.assertTrue(wavemix.fx_links_present("mic"))
+
+    def missing_playback(*args):
+      return {"-l": text.replace(
+                  "  |-> wavemix_micbus:playback_FR\n", ""),
+              "-o": outputs, "-i": inputs}.get(args[-1], "")
+
+    with patch.object(wavemix, "sh", side_effect=missing_playback):
+      self.assertFalse(wavemix.fx_links_present("mic"))
+
+    def missing_capture(*args):
+      return {"-l": text.replace("  |<- mic:capture_MONO\n", ""),
+              "-o": outputs, "-i": inputs}.get(args[-1], "")
+
+    with patch.object(wavemix, "sh", side_effect=missing_capture):
+      self.assertFalse(wavemix.fx_links_present("mic"))
 
   def test_apply_all_sends_updates_every_copy(self):
     state = {"channels": [{
