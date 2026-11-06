@@ -598,33 +598,57 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(12)
 
-                ToggleSwitch {
-                  id: micSwitch
-                  checked: !root.mutes.input
-                  hasCursor: root.view === "main" && root.cursorIndex === root.ctlMic
-                  foreground: root.foreground
-                  onHovered: function(on) { if (on) root.cursorIndex = root.ctlMic }
-                  onToggled: root.toggleMute("input")
+                Row {
+                  spacing: Style.space(6)
 
-                  PanelToolTip {
-                    visible: micSwitch.containsMouse
-                    text: "Microphone - " + (root.mutes.input ? "muted" : "on")
-                    fontFamily: root.fontFamily
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.mutes.input ? root.micOff : root.micOn
+                    color: root.mutes.input ? Qt.darker(root.foreground, 1.7) : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.subtitle
+                  }
+
+                  ToggleSwitch {
+                    id: micSwitch
+                    checked: !root.mutes.input
+                    hasCursor: root.view === "main" && root.cursorIndex === root.ctlMic
+                    foreground: root.foreground
+                    onHovered: function(on) { if (on) root.cursorIndex = root.ctlMic }
+                    onToggled: root.toggleMute("input")
+
+                    PanelToolTip {
+                      visible: micSwitch.containsMouse
+                      text: "Microphone - " + (root.mutes.input ? "muted" : "on")
+                      fontFamily: root.fontFamily
+                    }
                   }
                 }
 
-                ToggleSwitch {
-                  id: spkSwitch
-                  checked: !root.mutes.output
-                  hasCursor: root.view === "main" && root.cursorIndex === root.ctlSpk
-                  foreground: root.foreground
-                  onHovered: function(on) { if (on) root.cursorIndex = root.ctlSpk }
-                  onToggled: root.toggleMute("output")
+                Row {
+                  spacing: Style.space(6)
 
-                  PanelToolTip {
-                    visible: spkSwitch.containsMouse
-                    text: "Speakers - " + (root.mutes.output ? "muted" : "on")
-                    fontFamily: root.fontFamily
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.mutes.output ? root.spkOff : root.spkOn
+                    color: root.mutes.output ? Qt.darker(root.foreground, 1.7) : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.subtitle
+                  }
+
+                  ToggleSwitch {
+                    id: spkSwitch
+                    checked: !root.mutes.output
+                    hasCursor: root.view === "main" && root.cursorIndex === root.ctlSpk
+                    foreground: root.foreground
+                    onHovered: function(on) { if (on) root.cursorIndex = root.ctlSpk }
+                    onToggled: root.toggleMute("output")
+
+                    PanelToolTip {
+                      visible: spkSwitch.containsMouse
+                      text: "Speakers - " + (root.mutes.output ? "muted" : "on")
+                      fontFamily: root.fontFamily
+                    }
                   }
                 }
               }
