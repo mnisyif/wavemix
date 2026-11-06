@@ -715,6 +715,97 @@ def first_instance_of(state: dict, plugin_id: str) -> dict | None:
   return None
 
 
+# ------------------------------------------------------------------- snapshots
+
+def _control_snapshot(manifest: dict, instance: dict) -> list[dict]:
+  stored = instance.get("controls")
+  if not isinstance(stored, dict):
+    stored = {}
+  snapshot = []
+  for control in manifest.get("controls", []):
+    if not isinstance(control, dict):
+      continue
+    key = control.get("key")
+    snapshot.append({
+      "key": key,
+      "label": control.get("label"),
+      "value": stored.get(key, control.get("default")),
+      "min": control.get("min"),
+      "max": control.get("max"),
+      "step": control.get("step"),
+      "unit": control.get("unit"),
+    })
+  return snapshot
+
+
+def _instance_snapshot(instance: dict, manifest: dict | None,
+                       node: str | None) -> dict:
+  plugin = instance.get("plugin")
+  recorded = instance.get("pluginVersion")
+  if not isinstance(recorded, str) or not recorded:
+    recorded = manifest.get("version", "") if manifest else ""
+    version_changed = False
+  else:
+    version_changed = bool(
+      manifest and manifest.get("version") != recorded)
+
+  if manifest is None:
+    available = False
+    error = f"unknown plugin '{plugin}'"
+  else:
+    available = bool(manifest.get("available")) \
+        and not bool(manifest.get("error"))
+    error = manifest.get("error")
+
+  return {
+    "instance": instance.get("id"),
+    "plugin": plugin,
+    "pluginVersion": recorded,
+    "versionChanged": version_changed,
+    "enabled": bool(instance.get("enabled", True)),
+    "available": available,
+    "error": error,
+    "gpu": bool(manifest.get("gpu")) if manifest else False,
+    "node": node,
+    "controls": (_control_snapshot(manifest, instance)
+                 if manifest is not None else []),
+  }
+
+
+def state_snapshot(state: dict, manifests: dict[str, dict], version: str,
+                   running: bool) -> dict:
+  """Stable JSON for `wavemix fx state` and the Effects popup."""
+  micfx = state.get("micFx") if isinstance(state, dict) else None
+  if not isinstance(micfx, dict):
+    micfx = {}
+  chain = micfx.get("chain")
+  if not isinstance(chain, list):
+    chain = []
+
+  nodes = {
+    entry["instance"].get("id"): entry["node"]
+    for entry in enabled_instances(state, manifests)
+  }
+  rows = []
+  for instance in chain:
+    if not isinstance(instance, dict):
+      continue
+    plugin = instance.get("plugin")
+    manifest = manifests.get(plugin)
+    if not isinstance(manifest, dict):
+      manifest = None
+    rows.append(_instance_snapshot(
+      instance, manifest, nodes.get(instance.get("id"))))
+
+  return {
+    "wavemixVersion": version,
+    "enabled": bool(micfx.get("enabled")),
+    "running": bool(running),
+    "chain": rows,
+    "plugins": plugin_list(manifests),
+  }
+
+
 # --------------------------------------------------------------- live controls
 
 _CAPTURE_NODE_NAME = "wavemix_micfx.capture"

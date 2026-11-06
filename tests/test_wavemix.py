@@ -808,6 +808,203 @@ class MicfxCommandTests(unittest.TestCase):
                       output.getvalue())
 
 
+class CliFxTests(unittest.TestCase):
+  def setUp(self):
+    self._temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self._temp.cleanup)
+    self.root = Path(self._temp.name)
+    env = patch.dict(os.environ, {
+      "XDG_CONFIG_HOME": str(self.root / "config"),
+      "XDG_DATA_HOME": str(self.root / "data"),
+    })
+    env.start()
+    self.addCleanup(env.stop)
+
+    self.state_file = self.root / "wavemix" / "state.json"
+    self.state_file.parent.mkdir(parents=True, exist_ok=True)
+    self.config = self.root / "config" / "pipewire" / "pipewire.conf.d" \
+        / "90-wavemix-micfx.conf"
+    for name, value in (("STATE_FILE", self.state_file),
+                        ("STATE_DIR", self.state_file.parent),
+                        ("MICFX_CONF", self.config)):
+      patcher = patch.object(wavemix, name, value)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+
+    user = self.root / "user-plugins"
+    self.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", user, wavemix_fx.WAVEMIX_VERSION)
+    self.manifests["rnnoise"]["available"] = True
+    self.manifests["rnnoise"]["error"] = None
+    discover = patch.object(
+      wavemix.fx, "discover_manifests", return_value=self.manifests)
+    discover.start()
+    self.addCleanup(discover.stop)
+
+  def write_state(self, enabled=True, chain=None):
+    data = {
+      "version": 2,
+      "devices": {"output": "@DEFAULT_SINK@",
+                  "outputs": ["@DEFAULT_SINK@"],
+                  "input": "@DEFAULT_SOURCE@"},
+      "channels": [], "rules": {}, "defaults": {},
+      "micFx": {"enabled": enabled, "chain": chain or []},
+    }
+    self.state_file.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+  def rnnoise_instance(self):
+    return {"id": "rnnoise-1", "plugin": "rnnoise",
+            "pluginVersion": self.manifests["rnnoise"]["version"],
+            "enabled": True,
+            "controls": {"vadThreshold": 50, "vadGrace": 200,
+                         "retroactiveGrace": 0, "dryMix": 0}}
+
+  def test_fx_add_saves_renders_and_restarts(self):
+    self.write_state(enabled=True, chain=[])
+    restart = Mock(return_value=True)
+    with patch.object(wavemix, "restart_audio", restart), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(wavemix.main(["fx", "add", "highpass"]), 0)
+
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual([item["id"] for item in saved["micFx"]["chain"]],
+                     ["highpass-1"])
+    text = self.config.read_text(encoding="utf-8")
+    self.assertIn("name = fx0", text)
+    self.assertIn('"Freq" = 80', text)
+    restart.assert_called_once_with()
+
+  def test_fx_set_does_not_restart(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    restart = Mock(return_value=True)
+    with patch.object(wavemix, "restart_audio", restart), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(
+        wavemix.main(["fx", "set", "rnnoise-1", "vadThreshold", "60"]), 0)
+
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual(
+      saved["micFx"]["chain"][0]["controls"]["vadThreshold"], 60)
+    self.assertIn('"VAD Threshold (%)" = 60',
+                  self.config.read_text(encoding="utf-8"))
+    restart.assert_not_called()
+
+  def test_fx_set_json_reports_applied_false_when_node_is_missing(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    output = io.StringIO()
+    with patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(
+        wavemix.main(
+          ["fx", "set", "rnnoise-1", "vadThreshold", "60", "--json"]), 0)
+
+    out = json.loads(output.getvalue())
+    self.assertFalse(out["applied"])
+    self.assertEqual(out["instance"], "rnnoise-1")
+    self.assertEqual(out["control"], "vadThreshold")
+    self.assertEqual(out["value"], 60)
+
+  def test_fx_state_json_contains_versions_and_chain(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    output = io.StringIO()
+    with patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(wavemix.main(["fx", "state", "--json"]), 0)
+
+    out = json.loads(output.getvalue())
+    self.assertEqual(out["wavemixVersion"], wavemix_fx.WAVEMIX_VERSION)
+    self.assertTrue(out["enabled"])
+    self.assertTrue(out["running"])
+    self.assertIn("plugins", out)
+    entry = out["chain"][0]
+    self.assertEqual(entry["instance"], "rnnoise-1")
+    self.assertEqual(entry["plugin"], "rnnoise")
+    self.assertEqual(entry["pluginVersion"],
+                     self.manifests["rnnoise"]["version"])
+    self.assertFalse(entry["versionChanged"])
+    self.assertEqual(entry["node"], "fx0")
+    self.assertTrue(entry["available"])
+    controls = {item["key"]: item for item in entry["controls"]}
+    self.assertEqual(controls["vadThreshold"]["value"], 50)
+    self.assertEqual(controls["vadThreshold"]["min"], 0)
+    self.assertEqual(controls["vadThreshold"]["max"], 99)
+    self.assertEqual(controls["vadThreshold"]["unit"], "%")
+
+  def test_fx_state_reports_unavailable_plugin(self):
+    maxine = self.manifests["maxine-denoise"]
+    self.assertFalse(maxine["available"])
+    self.write_state(enabled=True, chain=[{
+      "id": "maxine-denoise-1", "plugin": "maxine-denoise",
+      "pluginVersion": maxine["version"], "enabled": True, "controls": {},
+    }])
+    output = io.StringIO()
+    with patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(wavemix.main(["fx", "state", "--json"]), 0)
+
+    out = json.loads(output.getvalue())
+    row = next(item for item in out["plugins"]
+               if item["id"] == "maxine-denoise")
+    self.assertFalse(row["available"])
+    self.assertIn("LADSPA plugin not found", row["error"])
+    self.assertIn("broadcast-maxine-ladspa", row["requires"])
+    self.assertTrue(row["gpu"])
+    entry = out["chain"][0]
+    self.assertFalse(entry["available"])
+    self.assertIn("LADSPA plugin not found", entry["error"])
+    self.assertTrue(entry["gpu"])
+
+  def test_micfx_controls_still_maps_to_first_rnnoise(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    output = io.StringIO()
+    with patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(wavemix.main(["micfx", "controls", "--json"]), 0)
+
+    out = json.loads(output.getvalue())
+    self.assertEqual(set(out), {"enabled", "available", "running", "controls"})
+    self.assertTrue(out["enabled"])
+    self.assertFalse(out["running"])
+    values = {item["key"]: item["value"] for item in out["controls"]}
+    self.assertEqual(values["vadThreshold"], 50)
+    self.assertEqual(values["vadGrace"], 200)
+    self.assertEqual(values["dryMix"], 0)
+
+  def test_fx_add_rejects_unknown_plugin_with_nonzero_exit(self):
+    self.write_state(enabled=True, chain=[])
+    with contextlib.redirect_stderr(io.StringIO()):
+      code = wavemix.main(["fx", "add", "does-not-exist"])
+    self.assertNotEqual(code, 0)
+
+  def test_version_flag_still_works(self):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), \
+         self.assertRaises(SystemExit) as raised:
+      wavemix.main(["--version"])
+    self.assertEqual(raised.exception.code, 0)
+    self.assertEqual(output.getvalue().strip(),
+                     f"wavemix {wavemix_fx.WAVEMIX_VERSION}")
+
+  def test_fx_enable_disable_rebuild_routes_without_restart(self):
+    for action, before, after in (("enable", False, True),
+                                  ("disable", True, False)):
+      with self.subTest(action=action):
+        self.write_state(enabled=before, chain=[])
+        restart = Mock(return_value=True)
+        with patch.object(wavemix, "restart_audio", restart), \
+             patch.object(wavemix, "up") as up, \
+             contextlib.redirect_stdout(io.StringIO()):
+          self.assertEqual(wavemix.main(["fx", action]), 0)
+
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["micFx"]["enabled"], after)
+        up.assert_called_once()
+        self.assertEqual(up.call_args.args[0]["micFx"]["enabled"], after)
+        restart.assert_not_called()
+
+
 class UpReapplyTests(unittest.TestCase):
   def test_up_reapplies_stored_chain_controls(self):
     state = {"version": 2,
