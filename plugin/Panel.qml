@@ -78,6 +78,15 @@ Panel {
   readonly property bool fxRunning: fxData ? fxData.running === true : false
   readonly property string fxVersion: (fxData && fxData.wavemixVersion)
     ? String(fxData.wavemixVersion) : ""
+  // The selected row owns the settings below the chain. It is resolved from
+  // the fresh state each refresh so it disappears with the instance.
+  readonly property var fxSelectedEntry: {
+    var chain = root.fxChain
+    for (var i = 0; i < chain.length; i++)
+      if (chain[i] && String(chain[i].instance) === root.fxSelected)
+        return chain[i]
+    return null
+  }
 
   // Chain editing happens in the Effects popup: "chain" is the current chain
   // and "add" is the plugin list. Structural commands restart audio, so only
@@ -88,6 +97,10 @@ Panel {
   property bool fxApplying: false
   property string fxError: ""
   property string fxLoadError: ""
+  // Optimistic control values keyed <instance, control>. A release writes the
+  // new value here before the CLI returns so the knob keeps its position; the
+  // entry is dropped once a fresh `fx state` reports the same value.
+  property var fxControlOverrides: ({})
   // The add list scrolls when the manifests do not fit. Leave room for the
   // header, back row, and section header before using the screen height.
   readonly property real fxAddListMaxHeight: Math.max(Style.space(120),
@@ -443,6 +456,108 @@ Panel {
         return String(root.fxPlugins[i].name || key)
     return key === "" ? "Unknown effect" : key
   }
+  function fxPluginMeta(id) {
+    var key = String(id || "")
+    for (var i = 0; i < root.fxPlugins.length; i++)
+      if (String(root.fxPlugins[i].id) === key)
+        return root.fxPlugins[i]
+    return null
+  }
+  function fxControlKey(instance, key) {
+    return String(instance) + "\u0001" + String(key)
+  }
+  function fxControlValue(instance, key, fallback) {
+    var override = root.fxControlOverrides[root.fxControlKey(instance, key)]
+    return override ? Number(override.value) : fallback
+  }
+  // Quantize to the manifest step so the optimistic value and the CLI agree.
+  function fxQuantizeControl(control, value) {
+    var number = Number(value)
+    if (!control || !isFinite(number)) return number
+    var min = Number(control.min)
+    var max = Number(control.max)
+    var step = Number(control.step)
+    if (isFinite(min)) number = Math.max(min, number)
+    if (isFinite(max)) number = Math.min(max, number)
+    if (isFinite(step) && step > 0 && isFinite(min))
+      number = min + Math.round((number - min) / step) * step
+    return Math.round(number * 1000000) / 1000000
+  }
+  function fxControlDecimals(control) {
+    var step = control ? Number(control.step) : 0
+    if (!isFinite(step) || step >= 1) return 0
+    var decimals = 0
+    var scaled = step
+    while (decimals < 4 && Math.abs(scaled - Math.round(scaled)) > 1e-6) {
+      scaled *= 10
+      decimals++
+    }
+    return decimals
+  }
+  function fxFormatControlValue(control, value) {
+    var number = Number(value)
+    if (!isFinite(number)) return ""
+    var text = number.toFixed(root.fxControlDecimals(control))
+    // A stored default may carry more precision than the step (e.g. Q = 0.707
+    // with step 0.1). Keep those digits until the user moves the knob.
+    if (Math.abs(number - Number(text)) > 1e-9)
+      text = number.toFixed(3)
+    if (text.indexOf(".") >= 0)
+      text = text.replace(/0+$/, "").replace(/\.$/, "")
+    return text
+  }
+  function fxControlUnit(control) {
+    return control ? String(control.unit || "") : ""
+  }
+  function setFxControl(instance, key, value, control) {
+    if (!root.fxData || root.fxApplying) return
+    var entry = root.fxSelectedEntry
+    if (!entry || String(entry.instance) !== String(instance)) return
+    if (entry.enabled === false || entry.available === false) return
+    var next = {}
+    for (var p in root.fxControlOverrides) next[p] = root.fxControlOverrides[p]
+    next[root.fxControlKey(instance, key)] = {
+      instance: String(instance),
+      key: String(key),
+      value: root.fxQuantizeControl(control, value)
+    }
+    root.fxControlOverrides = next
+    fxOverrideExpire.restart()
+    run(["fx", "set", String(instance), String(key),
+         String(root.fxQuantizeControl(control, value))])
+  }
+  // Drop overrides that a fresh state confirms (or whose control vanished).
+  // Anything left stays optimistic until the expiry timer clears it, so a
+  // failed `fx set` cannot leave a value pinned forever.
+  function reconcileFxOverrides() {
+    var overrides = root.fxControlOverrides
+    var keys = overrides ? Object.keys(overrides) : []
+    if (keys.length === 0) return
+    var next = {}
+    var chain = root.fxChain
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i]
+      var override = overrides[key]
+      var found = null
+      for (var j = 0; j < chain.length; j++) {
+        if (!chain[j] || String(chain[j].instance) !== override.instance) continue
+        var controls = chain[j].controls || []
+        for (var c = 0; c < controls.length; c++)
+          if (String(controls[c].key) === override.key) { found = controls[c]; break }
+        break
+      }
+      if (!found) continue
+      // The CLI rounds a value to the nearest step; a half-step tie can land
+      // one step away from the knob's optimistic value, so allow one step.
+      var tolerance = Math.max(0.000001,
+        Math.abs(Number(found.step) || 0) + 0.000001)
+      if (Math.abs(Number(found.value) - Number(override.value)) <= tolerance)
+        continue
+      next[key] = override
+    }
+    root.fxControlOverrides = next
+    if (Object.keys(next).length === 0) fxOverrideExpire.stop()
+  }
   function clampFxSelection() {
     var chain = root.fxChain
     if (chain.length === 0) {
@@ -609,6 +724,7 @@ Panel {
         try {
           root.fxData = JSON.parse(text)
           root.fxLoadError = ""
+          root.reconcileFxOverrides()
         } catch (e) {
           root.fxLoadError = "Could not load effects."
         }
@@ -698,6 +814,13 @@ Panel {
     interval: 500
     repeat: false
     onTriggered: root.refreshFxState()
+  }
+
+  Timer {
+    id: fxOverrideExpire
+    interval: 5000
+    repeat: false
+    onTriggered: root.fxControlOverrides = ({})
   }
 
   Timer {
@@ -1313,6 +1436,11 @@ Panel {
           }
         }
 
+        FxSettings {
+          width: parent.width
+          visible: root.fxSelectedEntry !== null
+        }
+
         PanelSeparator { foreground: root.foreground }
 
         Item {
@@ -1534,6 +1662,233 @@ Panel {
           fontFamily: root.fontFamily
           onClicked: root.fxRemoveEffect(chainRow.instanceId)
         }
+      }
+    }
+  }
+
+  // Settings for the selected chain entry. Sliders write through `fx set`
+  // and stay disabled for bypassed or unavailable effects.
+  component FxSettings: Column {
+    id: settings
+    property var entry: root.fxSelectedEntry
+
+    readonly property string pluginId: (settings.entry && settings.entry.plugin)
+      ? String(settings.entry.plugin) : ""
+    readonly property var meta: root.fxPluginMeta(settings.pluginId)
+    readonly property var controls: (settings.entry && settings.entry.controls
+      && typeof settings.entry.controls.length === "number")
+      ? settings.entry.controls : []
+    readonly property bool available: settings.entry
+      ? settings.entry.available !== false : false
+    readonly property bool active: settings.entry
+      ? settings.entry.enabled !== false : false
+    readonly property bool editable: root.fxData !== null && !root.fxApplying
+      && settings.available && settings.active
+    readonly property string version: (settings.entry && settings.entry.pluginVersion)
+      ? String(settings.entry.pluginVersion) : ""
+    readonly property string requires: settings.meta
+      ? String(settings.meta.requires || "") : ""
+    readonly property string error: (settings.entry && settings.entry.error)
+      ? String(settings.entry.error) : ""
+    readonly property bool versionChanged: settings.entry
+      ? settings.entry.versionChanged === true : false
+    readonly property bool gpu: settings.entry ? settings.entry.gpu === true : false
+
+    spacing: Style.space(6)
+
+    Row {
+      width: parent.width
+      spacing: Style.space(6)
+
+      Text {
+        id: settingsName
+        width: Math.max(0, parent.width - settingsMeta.width - parent.spacing)
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.fxPluginName(settings.pluginId)
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: settings.available ? root.foreground
+                                  : Qt.darker(root.foreground, 1.9)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+      }
+
+      Row {
+        id: settingsMeta
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(6)
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: settings.version !== ""
+          text: "v" + settings.version
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.5)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: settings.gpu
+          text: "GPU"
+          textFormat: Text.PlainText
+          color: settings.available ? Color.accent
+                                    : Qt.darker(root.foreground, 1.9)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+    }
+
+    Text {
+      width: parent.width
+      visible: settings.versionChanged
+      text: "Plugin definition changed since this effect was added; check its settings."
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      color: Color.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      width: parent.width
+      visible: !settings.available
+      text: settings.error !== "" ? settings.error : "Effect unavailable."
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      color: Color.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      width: parent.width
+      visible: !settings.available && settings.requires !== ""
+      text: settings.requires
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      color: Qt.darker(root.foreground, 1.5)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      width: parent.width
+      visible: settings.available && !settings.active
+      text: "Bypassed — settings are read-only."
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      color: Qt.darker(root.foreground, 1.5)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      width: parent.width
+      visible: settings.available && settings.controls.length === 0
+      text: "No adjustable settings."
+      textFormat: Text.PlainText
+      color: Qt.darker(root.foreground, 1.5)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Repeater {
+      model: settings.controls
+
+      FxControlRow {
+        required property var modelData
+        width: settings.width
+        instanceId: settings.entry ? String(settings.entry.instance) : ""
+        control: modelData
+        editable: settings.editable
+      }
+    }
+  }
+
+  component FxControlRow: Item {
+    id: controlRow
+    property string instanceId: ""
+    property var control: null
+    property bool editable: true
+
+    readonly property string controlKey: controlRow.control
+      ? String(controlRow.control.key) : ""
+    readonly property real controlMin: controlRow.control
+      ? Number(controlRow.control.min) : 0
+    readonly property real controlMax: controlRow.control
+      ? Number(controlRow.control.max) : 100
+    readonly property real controlStep: controlRow.control
+      ? Number(controlRow.control.step) : 1
+    readonly property bool integer: controlRow.controlStep >= 1
+    readonly property real currentValue: root.fxControlValue(
+      controlRow.instanceId, controlRow.controlKey,
+      controlRow.control ? Number(controlRow.control.value) : 0)
+    readonly property real shownValue: controlSlider.dragging
+      ? controlSlider.liveValue : controlRow.currentValue
+    readonly property string valueText: root.fxFormatControlValue(
+      controlRow.control, controlRow.shownValue)
+      + root.fxControlUnit(controlRow.control)
+
+    implicitHeight: Math.max(controlLabel.implicitHeight,
+                             controlSlider.implicitHeight) + Style.space(4)
+
+    Row {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      Text {
+        id: controlLabel
+        width: Style.space(112)
+        anchors.verticalCenter: parent.verticalCenter
+        text: controlRow.control
+          ? String(controlRow.control.label || controlRow.controlKey) : ""
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: controlRow.editable ? root.foreground
+                                   : Qt.darker(root.foreground, 1.7)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      PanelSlider {
+        id: controlSlider
+        width: Math.max(0, parent.width - controlLabel.width
+          - controlValue.width - parent.spacing * 2)
+        anchors.verticalCenter: parent.verticalCenter
+        bar: root.bar
+        minimum: controlRow.controlMin
+        maximum: controlRow.controlMax
+        step: controlRow.controlStep > 0 ? controlRow.controlStep : 1
+        integer: controlRow.integer
+        enabled: controlRow.editable
+        value: controlRow.currentValue
+        onReleased: function(v) {
+          root.setFxControl(controlRow.instanceId, controlRow.controlKey,
+                            v, controlRow.control)
+        }
+      }
+
+      Text {
+        id: controlValue
+        width: Style.space(58)
+        anchors.verticalCenter: parent.verticalCenter
+        horizontalAlignment: Text.AlignRight
+        text: controlRow.valueText
+        textFormat: Text.PlainText
+        elide: Text.ElideLeft
+        color: controlRow.editable ? root.foreground
+                                   : Qt.darker(root.foreground, 1.7)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
     }
   }
