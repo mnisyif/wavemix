@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "mnisyif.wavemix",
+  "name": "Wavemix",
+  "version": "1.0.0",
+  "author": "mnisyif",
+  "description": "Route app and mic audio to speaker and virtual-mic channels over PipeWire",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Wavemix",
+    "description": "Channel mixer: two sends per channel (speakers + virtual mic)",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

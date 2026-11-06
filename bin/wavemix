@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""wavemix - PipeWire channel mixer for the Omarchy bar (Stage 1: graph engine).
+
+A channel is a bus with two sends, each with a fader and an enable check:
+
+  apps ---> wavemix_<id> (null-sink) --monitor--+--loopback--> speakers   [output]
+                                                  +--loopback--> wavemix_mic [input]
+  mic  --------------------------------------------+--loopback--> speakers   [output]
+                                                  +--loopback--> wavemix_mic [input]
+  wavemix_mic.monitor --remap--> wavemix_virtual_mic  (shows up as a mic)
+
+Each loopback is a PulseAudio stream tagged `wavemix=<channel>:<send>`, so its
+volume and mute ARE that send's fader and check. All state lives in
+~/.config/wavemix/state.json; `up` rebuilds the graph to match it.
+
+Everything here is user-level: no sudo, no config outside ~/.config/wavemix.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "wavemix"
+STATE_FILE = STATE_DIR / "state.json"
+LEGACY_STATE_FILE = STATE_DIR.parent / "wavelink" / "state.json"
+
+MIC_BUS = "wavemix_micbus"           # null-sink carrying the mic only
+MIC_BUS_SOURCE = "wavemix_mic_bus"   # its remapped source ("Wavemix Mic")
+STREAM_BUS = "wavemix_streambus"     # null-sink carrying mic + selected channels
+STREAM_BUS_SOURCE = "wavemix_stream_bus"  # its remapped source ("Wavemix Stream")
+MICFX_SOURCE = "wavemix_micfx"       # the mic effect chain's internal node
+MICFX_CAPTURE = "wavemix_micfx.capture"  # its capture (input) node
+MICFX_CONF = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) \
+    / "pipewire" / "pipewire.conf.d" / "90-wavemix-micfx.conf"
+MICBUS_TAG = "micbus"                # loopback tag for mic -> mic bus
+TAG_KEY = "wavemix"
+NULL_PREFIX = "wavemix_"
+SEND_LATENCY_MS = 20
+HEADROOM = 0.891  # -1 dBFS: the peak target for every summed send bus
+
+DEFAULT_STATE = {
+    "version": 1,
+    "devices": {"output": "@DEFAULT_SINK@", "input": "@DEFAULT_SOURCE@"},
+    "channels": [
+        {"id": "mic", "name": "My Mic", "source": "mic",
+         "output": {"on": False, "volume": 50}, "input": {"on": True, "volume": 100}},
+        {"id": "browser", "name": "Browser", "source": "apps",
+         "output": {"on": True, "volume": 70}, "input": {"on": False, "volume": 50}},
+        {"id": "music", "name": "Music", "source": "apps",
+         "output": {"on": True, "volume": 70}, "input": {"on": False, "volume": 50}},
+        {"id": "games", "name": "Games", "source": "apps",
+         "output": {"on": True, "volume": 70}, "input": {"on": False, "volume": 50}},
+        {"id": "voice", "name": "Voice", "source": "apps",
+         "output": {"on": True, "volume": 70}, "input": {"on": False, "volume": 50}},
+    ],
+    "rules": {},
+    "micFx": {"enabled": False},
+    "defaults": {"source": "", "sink": ""},
+}
+
+
+# --------------------------------------------------------------------- helpers
+
+def sh(*args: str) -> str:
+  try:
+    out = subprocess.run(args, capture_output=True, text=True, timeout=8)
+  except Exception as exc:  # noqa: BLE001
+    print(f"wavemix: failed to run {args!r}: {exc}", file=sys.stderr)
+    return ""
+  if out.returncode != 0 and out.stderr.strip():
+    print(f"wavemix: {args[0]}: {out.stderr.strip()}", file=sys.stderr)
+  return out.stdout
+
+
+def pactl_json(kind: str):
+  raw = sh("pactl", "-f", "json", "list", kind)
+  try:
+    return json.loads(raw or "[]")
+  except json.JSONDecodeError:
+    return []
+
+
+def short_modules() -> list[tuple[int, str, str]]:
+  """(index, name, argument) from `pactl list short modules`."""
+  out: list[tuple[int, str, str]] = []
+  for line in sh("pactl", "list", "short", "modules").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 2 or not parts[0].strip().isdigit():
+      continue
+    out.append((int(parts[0].strip()), parts[1].strip(),
+                parts[2].strip() if len(parts) > 2 else ""))
+  return out
+
+
+def sink_inputs() -> list[dict]:
+  return pactl_json("sink-inputs")
+
+
+def sinks() -> list[dict]:
+  return pactl_json("sinks")
+
+
+def sources() -> list[dict]:
+  return pactl_json("sources")
+
+
+def slug(text: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "channel"
+
+
+def sink_name(channel_id: str) -> str:
+  return NULL_PREFIX + channel_id
+
+
+def is_virtual(name: str) -> bool:
+  """A wavemix/wavelink bus (a channel sink or the virtual mic) - never a real device."""
+  return name.startswith(NULL_PREFIX) or name.startswith("wavelink_")
+
+
+# PipeWire sets device.api on real hardware nodes (USB/PCI ALSA, Bluetooth);
+# virtual nodes (null sinks, loopbacks, filters, monitors) do not carry one.
+HARDWARE_APIS = {"alsa", "bluez", "bluez5", "oss"}
+
+
+def hardware_devices(which: str) -> list[dict]:
+  """Real output/input devices only - no buses, filters or monitors."""
+  items = sinks() if which == "output" else sources()
+  out = []
+  for device in items:
+    name = str(device.get("name") or "")
+    props = device.get("properties") or {}
+    if is_virtual(name):
+      continue
+    if str(props.get("device.api") or "") not in HARDWARE_APIS:
+      continue
+    if str(props.get("device.class") or "") == "monitor" or name.endswith(".monitor"):
+      continue
+    out.append({"name": name,
+                "description": str(props.get("device.description")
+                                   or device.get("description") or name)})
+  return out
+
+
+def load_module(module: str, *args: str) -> int | None:
+  out = sh("pactl", "load-module", module, *args).strip()
+  return int(out) if out.isdigit() else None
+
+
+def unload_all() -> int:
+  gone = 0
+  for index, name, argument in short_modules():
+    blob = argument + " " + name
+    # "wavelink" is the pre-rename graph; sweep it out too.
+    if "wavemix" in blob or "wavelink" in blob:
+      sh("pactl", "unload-module", str(index))
+      gone += 1
+  return gone
+
+
+def existing_sink_names() -> set[str]:
+  return {str(s.get("name") or "") for s in sinks()}
+
+
+def existing_source_names() -> set[str]:
+  return {str(s.get("name") or "") for s in sources()}
+
+
+def stream_for(channel_id: str, send: str) -> dict | None:
+  want = f"{channel_id}:{send}"
+  for si in sink_inputs():
+    if str((si.get("properties") or {}).get(TAG_KEY) or "") == want:
+      return si
+  return None
+
+
+def volume_percent(si: dict) -> int:
+  vol = (si.get("volume") or {}).get("front-left") or {}
+  pct = str(vol.get("value_percent") or "0%").rstrip("%")
+  try:
+    return int(round(float(pct)))
+  except ValueError:
+    return 0
+
+
+def fader_gain(volume: int) -> float:
+  """PulseAudio's percentage is cubic in amplitude: 100% -> 1.0, 50% -> 0.125."""
+  return (max(0, min(100, int(volume))) / 100.0) ** 3
+
+
+def bus_trim(state: dict, send: str) -> float:
+  """Peak-safe master trim for one send bus.
+
+  Every enabled send is summed at unity, so a handful of hot faders can push
+  the mix past 0 dBFS and hard-clip an integer consumer - most visibly the
+  stream bus OBS records. Scale the whole bus by one factor when, and only
+  when, the active faders would exceed the headroom target. Scaling every send
+  equally keeps the balance the user set."""
+  total = 0.0
+  for channel in state.get("channels", []):
+    cfg = channel.get(send) or {}
+    if cfg.get("on", True):
+      total += fader_gain(cfg.get("volume", 100))
+  if total <= 1.0:
+    return 1.0
+  return HEADROOM / total
+
+
+def trimmed_percent(volume: int, trim: float) -> int:
+  """The pactl percentage that gives this fader's gain times the bus trim.
+
+  PulseAudio's cubic curve means a gain ratio t is a percentage ratio of
+  t**(1/3). Flooring keeps the rounded value under the target."""
+  return max(0, min(100, int(int(volume) * (max(0.0, trim) ** (1.0 / 3.0)))))
+
+
+# ----------------------------------------------------------------------- state
+
+def load_state() -> dict:
+  # Migrate a pre-rename state file on first use.
+  if not STATE_FILE.is_file() and LEGACY_STATE_FILE.is_file():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(LEGACY_STATE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+  if not STATE_FILE.is_file():
+    return json.loads(json.dumps(DEFAULT_STATE))
+  data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+  data.setdefault("devices", {"output": "@DEFAULT_SINK@", "input": "@DEFAULT_SOURCE@"})
+  data.setdefault("channels", [])
+  data.setdefault("rules", {})
+  data.setdefault("micFx", {"enabled": False})
+  data.setdefault("defaults", {"source": "", "sink": ""})
+  return data
+
+
+def save_state(state: dict) -> None:
+  STATE_DIR.mkdir(parents=True, exist_ok=True)
+  tmp = STATE_FILE.with_suffix(".json.tmp")
+  tmp.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+  tmp.replace(STATE_FILE)
+
+
+@contextmanager
+def graph_lock():
+  """Serialize graph rebuilds between the watcher and a CLI/panel command.
+
+  Without this, a command's rebuild can overlap the watcher's reconcile tick;
+  both unload and re-add modules, leaving duplicate loopbacks and dropouts."""
+  STATE_DIR.mkdir(parents=True, exist_ok=True)
+  with open(STATE_DIR / ".graph.lock", "w", encoding="utf-8") as handle:
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    try:
+      yield
+    finally:
+      fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def find_channel(state: dict, ident: str) -> dict | None:
+  ident = str(ident).lower()
+  for ch in state["channels"]:
+    if str(ch["id"]).lower() == ident or str(ch.get("name", "")).lower() == ident:
+      return ch
+  return None
+
+
+def channel_target(channel: dict, send: str, devices: dict) -> str | None:
+  if send == "output":
+    return devices.get("output") or "@DEFAULT_SINK@"
+  if send == "input":
+    # A channel's "in" send feeds the Stream bus (mic + whatever you include).
+    return STREAM_BUS
+  return None
+
+
+def mic_fx_enabled(state: dict) -> bool:
+  return bool((state.get("micFx") or {}).get("enabled"))
+
+
+def mic_fx_available() -> bool:
+  return MICFX_CONF.is_file()
+
+
+def mic_source(state: dict) -> str:
+  """Where the buses pull the mic from. With FX on, the filter-chain feeds the
+  mic bus, so the buses take its monitor; otherwise the raw hardware mic."""
+  if mic_fx_enabled(state):
+    return MIC_BUS + ".monitor"
+  return str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
+
+
+def _pwlink(*args: str) -> None:
+  """Run pw-link, ignoring errors (a link that already exists is fine)."""
+  try:
+    subprocess.run(("pw-link",) + args, capture_output=True, text=True, timeout=5)
+  except Exception:  # noqa: BLE001
+    pass
+
+
+def set_mic_fx_link(mic: str, on: bool) -> None:
+  """Connect the hardware mic to the FX chain's capture (or disconnect it).
+
+  The chain's capture is autoconnect=false so WirePlumber never wires it to the
+  default source - which may be one of our own buses, and would loop the mic bus
+  back into itself (runaway feedback = chopping/howling)."""
+  outs = [line.strip() for line in sh("pw-link", "-o").splitlines()
+          if line.strip().startswith(mic + ":")]
+  ins = [line.strip() for line in sh("pw-link", "-i").splitlines()
+         if line.strip().startswith(MICFX_CAPTURE + ":")]
+  if not outs or not ins:
+    return
+  _pwlink(outs[0], ins[0]) if on else _pwlink("-d", outs[0], ins[0])
+
+
+def set_mic_fx_playback_link() -> None:
+  """Feed every channel of the mic bus from the FX chain.
+
+  The chain's output is mono and node.target only makes WirePlumber link it to
+  one channel of the stereo mic bus, leaving the other channel silent. Link
+  all mic-bus inputs explicitly; never touch a hardware output."""
+  outs = [line.strip() for line in sh("pw-link", "-o").splitlines()
+          if line.strip().startswith(MICFX_SOURCE + ":")]
+  ins = [line.strip() for line in sh("pw-link", "-i").splitlines()
+         if line.strip().startswith(MIC_BUS + ":playback_")]
+  for out in outs:
+    for inp in ins:
+      _pwlink(out, inp)
+
+
+def channel_capture(channel: dict, devices: dict, mic: str) -> str | None:
+  if channel.get("source") == "mic":
+    return mic
+  return sink_name(channel["id"]) + ".monitor"
+
+
+# ------------------------------------------------------------------- graph ops
+
+def ensure_bus(sink: str, source: str, sink_description: str, source_name: str) -> None:
+  if sink not in existing_sink_names():
+    load_module("module-null-sink", f"sink_name={sink}",
+                f'sink_properties=priority.session=1 device.description="{sink_description}"')
+  if source not in existing_source_names():
+    # module-remap-source only honors a LONE node.description for the source's
+    # display name, and its property parser drops spaces - so the source name
+    # can carry no spaces (hence Wavemix-Mic, not "Wavemix Mic").
+    load_module("module-remap-source", f"master={sink}.monitor",
+                f"source_name={source}",
+                f"source_properties=node.description={source_name}")
+
+
+def ensure_buses() -> None:
+  ensure_bus(MIC_BUS, MIC_BUS_SOURCE, "Wavemix Mic", "Wavemix-Mic")
+  ensure_bus(STREAM_BUS, STREAM_BUS_SOURCE, "Wavemix Stream", "Wavemix-Stream")
+
+
+def normalize_mic_bus_feed() -> None:
+  """Keep the raw-mic feed at unity and unmuted.
+
+  module-stream-restore keys saved state by media.name, and a loopback's
+  media.name is derived from its module index. Indices are reused across
+  rebuilds, so this feed can inherit the mute/volume of an unrelated send
+  (most often the muted mic:output) and silently kill the microphone. The
+  feed has no fader of its own - the mic channel's input fader is the control -
+  so it must always sit at unity and stay unmuted."""
+  for si in sink_inputs():
+    if (si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG:
+      index = str(si["index"])
+      sh("pactl", "set-sink-input-volume", index, "100%")
+      sh("pactl", "set-sink-input-mute", index, "0")
+
+
+def ensure_mic_bus_feed(mic: str) -> None:
+  """Feed the Mic bus from the raw hardware mic (used when mic FX is off)."""
+  if not any((si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG
+             for si in sink_inputs()):
+    load_module("module-loopback", f"source={mic}", f"sink={MIC_BUS}",
+                f"latency_msec={SEND_LATENCY_MS}",
+                f"sink_input_properties={TAG_KEY}={MICBUS_TAG}")
+  normalize_mic_bus_feed()
+
+
+def ensure_channel_sink(channel: dict) -> None:
+  if channel.get("source") == "mic":
+    return
+  name = sink_name(channel["id"])
+  label = str(channel.get("name", channel["id"]))
+  if name not in existing_sink_names():
+    load_module("module-null-sink", f"sink_name={name}",
+                f'sink_properties=priority.session=1 device.description="Wavemix {label}"')
+  # A named capture source so OBS (and anything else) can record this channel on
+  # its own. Pre-fader: it carries the raw channel audio.
+  capture = name + "_capture"
+  if capture not in existing_source_names():
+    load_module("module-remap-source", f"master={name}.monitor",
+                f"source_name={capture}",
+                f"source_properties=node.description=Wavemix-{label.replace(' ', '-')}")
+
+
+def ensure_send(channel: dict, send: str, devices: dict, mic: str) -> None:
+  if stream_for(channel["id"], send) is not None:
+    return
+  capture = channel_capture(channel, devices, mic)
+  target = channel_target(channel, send, devices)
+  if not capture or not target:
+    return
+  # Create muted: apply_all_sends() levels every send right after the graph is
+  # built, and until then a fresh loopback must not blurt its source into the
+  # output (that transient is what leaks the mic into the headphones).
+  load_module("module-loopback", f"source={capture}", f"sink={target}",
+              f"latency_msec={SEND_LATENCY_MS}",
+              "sink_input_muted=1",
+              f"sink_input_properties={TAG_KEY}={channel['id']}:{send}")
+
+
+def apply_all_sends(state: dict) -> None:
+  """Push every send's level and mute onto its live loopback.
+
+  One `pactl list` covers the whole graph. Toggling or leveling one send moves
+  the bus trim, which changes every other send's live gain too, so all of them
+  are rewritten together."""
+  streams: dict[str, dict] = {}
+  for si in sink_inputs():
+    tag = str((si.get("properties") or {}).get(TAG_KEY) or "")
+    if tag:
+      streams[tag] = si
+  trims = {send: bus_trim(state, send) for send in ("output", "input")}
+  for channel in state["channels"]:
+    for send in ("output", "input"):
+      si = streams.get(f"{channel['id']}:{send}")
+      if si is None:
+        continue
+      cfg = channel.get(send) or {}
+      index = str(si["index"])
+      sh("pactl", "set-sink-input-volume", index,
+         f"{trimmed_percent(int(cfg.get('volume', 100)), trims[send])}%")
+      sh("pactl", "set-sink-input-mute", index, "0" if cfg.get("on", True) else "1")
+
+
+def sanitize_devices(state: dict) -> bool:
+  """Keep the engine's output/input on real hardware (never a bus or a sentinel)."""
+  changed = False
+  for which in ("output", "input"):
+    names = {d["name"] for d in hardware_devices(which)}
+    cur = str(state["devices"].get(which) or "")
+    if cur in names:
+      continue
+    pick = default_name(which)
+    if pick not in names:
+      pick = next(iter(names)) if names else ("@DEFAULT_SINK@" if which == "output" else "@DEFAULT_SOURCE@")
+    if cur != pick:
+      state["devices"][which] = pick
+      changed = True
+  return changed
+
+
+def ensure_defaults(state: dict) -> None:
+  """Keep the system default in step with the user's choice, and stop a bus
+  from becoming the default on its own (e.g. after a pipewire restart)."""
+  for which in ("sink", "source"):
+    port = "output" if which == "sink" else "input"
+    want = str((state.get("defaults") or {}).get(which) or "")
+    cur = default_name(port)
+    if want:
+      if want != cur:
+        sh("pactl", "set-default-" + which, want)
+    elif is_virtual(cur):
+      hardware = hardware_devices(port)
+      if hardware:
+        sh("pactl", "set-default-" + which, hardware[0]["name"])
+
+
+def up(state: dict) -> None:
+  # Self-heal a stored device that points at a bus or a vanished device.
+  if sanitize_devices(state):
+    save_state(state)
+  unload_all()
+  ensure_buses()
+  ensure_defaults(state)
+  mic = mic_source(state)
+  raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
+  if mic_fx_enabled(state):
+    # The filter-chain feeds the mic bus; wire the mic into the chain explicitly.
+    set_mic_fx_link(raw_mic, True)
+    set_mic_fx_playback_link()
+  else:
+    set_mic_fx_link(raw_mic, False)
+    ensure_mic_bus_feed(mic)
+  for channel in state["channels"]:
+    ensure_channel_sink(channel)
+    for send in ("output", "input"):
+      ensure_send(channel, send, state["devices"], mic)
+  apply_all_sends(state)
+
+
+# ---------------------------------------------------------------- apps + rules
+
+def sink_name_by_index() -> dict[str, str]:
+  return {str(s.get("index")): str(s.get("name") or "") for s in sinks()}
+
+
+def app_key(si: dict) -> str:
+  """Stable-ish identity for a stream: the app name, else its binary."""
+  props = si.get("properties") or {}
+  return str(props.get("application.name")
+             or props.get("application.process.binary")
+             or props.get("media.name") or "").strip()
+
+
+def app_channel(si: dict, by_index: dict[str, str]) -> str:
+  name = by_index.get(str(si.get("sink")), "")
+  return name[len(NULL_PREFIX):] if name.startswith(NULL_PREFIX) else ""
+
+
+def app_streams() -> list[dict]:
+  """Every sink-input that is not one of our own loopbacks."""
+  return [si for si in sink_inputs() if not (si.get("properties") or {}).get(TAG_KEY)]
+
+
+def graph_up(state: dict) -> bool:
+  sources = existing_source_names()
+  if MIC_BUS_SOURCE not in sources or STREAM_BUS_SOURCE not in sources:
+    return False
+  # With mic FX on, the filter chain feeds the mic bus directly and the raw
+  # mic->micbus loopback is deliberately absent. Requiring that loopback in
+  # that mode makes graph_up() always false, so the watcher tears down and
+  # rebuilds the whole graph on every tick (audio dropouts/clipping).
+  if not mic_fx_enabled(state) and not any(
+      (si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG for si in sink_inputs()):
+    return False
+  name = existing_sink_names()
+  for channel in state["channels"]:
+    if channel.get("source") == "mic":
+      continue
+    if sink_name(channel["id"]) not in name:
+      return False
+    for send in ("output", "input"):
+      if stream_for(channel["id"], send) is None:
+        return False
+  return True
+
+
+def reconcile(state: dict) -> None:
+  """Keep the graph alive and move apps onto their rule's channel."""
+  ensure_defaults(state)
+  with graph_lock():
+    if not graph_up(state):
+      up(state)
+  by_index = sink_name_by_index()
+  rules = state.get("rules", {})
+  for si in app_streams():
+    target = rules.get(app_key(si).lower())
+    if not target:
+      continue
+    channel = find_channel(state, target)
+    if channel is None or channel.get("source") == "mic":
+      continue
+    want = sink_name(channel["id"])
+    if by_index.get(str(si.get("sink"))) != want:
+      sh("pactl", "move-sink-input", str(si["index"]), want)
+
+
+
+
+def status(state: dict, as_json: bool) -> None:
+  sources = existing_source_names()
+  trims = {send: bus_trim(state, send) for send in ("output", "input")}
+  live = {"buses": {"mic": MIC_BUS_SOURCE in sources, "stream": STREAM_BUS_SOURCE in sources},
+          "channels": {}}
+  for channel in state["channels"]:
+    entry = {"name": channel.get("name"), "source": channel.get("source"), "sends": {}}
+    for send in ("output", "input"):
+      si = stream_for(channel["id"], send)
+      cfg = channel.get(send) or {}
+      entry["sends"][send] = {
+        "on": bool(cfg.get("on", True)),
+        "volume": int(cfg.get("volume", 100)),
+        "trim": round(trims[send], 4),
+        "live": si is not None,
+        "liveVolume": volume_percent(si) if si else None,
+        "liveMuted": bool(si.get("mute")) if si else None,
+      }
+    live["channels"][channel["id"]] = entry
+  out = {"devices": {"output": selected_device("output", state), "input": selected_device("input", state)},
+         "defaults": {"sink": default_name("output"), "source": default_name("input")},
+         "micFx": {"enabled": mic_fx_enabled(state), "available": mic_fx_available()},
+         "rules": state.get("rules", {}),
+         "mutes": {"output": device_mute("output", state), "input": device_mute("input", state)},
+         "headroom": {send: round(trims[send], 4) for send in ("output", "input")},
+         "buses": live["buses"],
+         "graph": live}
+  if as_json:
+    print(json.dumps(out, indent=2))
+    return
+  print(f"output device : {selected_device('output', state)}")
+  print(f"input device  : {selected_device('input', state)}")
+  print(f"default sink  : {default_name('output')}")
+  print(f"default source: {default_name('input')}")
+  print(f"mic bus       : {MIC_BUS_SOURCE} {'OK' if live['buses']['mic'] else 'MISSING (run: wavemix up)'}")
+  print(f"stream bus    : {STREAM_BUS_SOURCE} {'OK' if live['buses']['stream'] else 'MISSING (run: wavemix up)'}")
+  print(f"mic fx        : {'on' if mic_fx_enabled(state) else 'off'}"
+        + ("" if mic_fx_available() else "  (chain fragment missing)"))
+  for cid, ch in live["channels"].items():
+    print(f"  {cid:8}  {ch['name']}")
+    for send, s in ch["sends"].items():
+      mark = "on " if s["on"] else "off"
+      state_live = f"{s['liveVolume']:>3}%" if s["live"] else "  -- "
+      print(f"    {send:6} {mark}  vol {s['volume']:>3}%   live {state_live}{'  muted' if s['liveMuted'] else ''}")
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_init(args) -> None:
+  if STATE_FILE.is_file() and not args.force:
+    print(f"wavemix: {STATE_FILE} already exists (use --force to overwrite)")
+    return
+  save_state(json.loads(json.dumps(DEFAULT_STATE)))
+  print(f"wrote {STATE_FILE}")
+
+
+def cmd_up(args) -> None:
+  state = load_state()
+  with graph_lock():
+    save_state(state)
+    up(state)
+  print("wavemix: graph up")
+
+
+def cmd_down(args) -> None:
+  with graph_lock():
+    gone = unload_all()
+  print(f"wavemix: removed {gone} module(s)")
+
+
+def cmd_restart(args) -> None:
+  state = load_state()
+  with graph_lock():
+    unload_all()
+    up(state)
+  print("wavemix: graph rebuilt")
+
+
+def cmd_status(args) -> None:
+  status(load_state(), args.json)
+
+
+def cmd_send(args) -> None:
+  state = load_state()
+  channel = find_channel(state, args.channel)
+  if channel is None:
+    sys.exit(f"wavemix: no such channel: {args.channel}")
+  cfg = channel.setdefault(args.send, {})
+  if args.action == "on":
+    cfg["on"] = True
+  elif args.action == "off":
+    cfg["on"] = False
+  elif args.action == "toggle":
+    cfg["on"] = not cfg.get("on", True)
+  elif args.action == "volume":
+    if args.value is None:
+      sys.exit("wavemix: volume needs a value 0-100")
+    cfg["volume"] = max(0, min(100, int(args.value)))
+  save_state(state)
+  apply_all_sends(state)
+  print(f"wavemix: {channel['id']} {args.send} -> on={cfg.get('on')} volume={cfg.get('volume')}")
+
+
+def cmd_channel(args) -> None:
+  state = load_state()
+  if args.action == "add":
+    if not args.name:
+      sys.exit("wavemix: channel add needs a name")
+    cid = slug(args.name)
+    if find_channel(state, cid):
+      sys.exit(f"wavemix: channel '{cid}' already exists")
+    state["channels"].append({
+      "id": cid, "name": args.name, "source": "mic" if args.mic else "apps",
+      "output": {"on": False if args.mic else True, "volume": 50 if args.mic else 70},
+      "input": {"on": True if args.mic else False, "volume": 100 if args.mic else 50},
+    })
+    save_state(state)
+    print(f"wavemix: added channel {cid} (run `wavemix up` to build it)")
+  elif args.action == "remove":
+    channel = find_channel(state, args.name or "")
+    if channel is None:
+      sys.exit(f"wavemix: no such channel: {args.name}")
+    cid = channel["id"]
+    state["channels"] = [c for c in state["channels"] if c is not channel]
+    # A rule pointing at a channel that no longer exists is dead weight.
+    state["rules"] = {k: v for k, v in state.get("rules", {}).items() if v != cid}
+    save_state(state)
+    print(f"wavemix: removed channel {cid} (run `wavemix up` to rebuild)")
+  else:
+    sys.exit("wavemix: channel needs add|remove")
+
+
+def device_mute(which: str, state: dict) -> bool:
+  """Mute state of the selected physical output/input device."""
+  name = str(state["devices"].get(which, ""))
+  items = sinks() if which == "output" else sources()
+  for device in items:
+    if str(device.get("name")) == name:
+      return bool(device.get("mute"))
+  return False
+
+
+def cmd_device(args) -> None:
+  state = load_state()
+  if is_virtual(args.name):
+    sys.exit(f"wavemix: {args.name} is a wavemix bus, not a real device")
+  state["devices"][args.which] = args.name
+  with graph_lock():
+    save_state(state)
+    up(state)
+  print(f"wavemix: {args.which} -> {args.name}")
+
+
+def default_name(which: str) -> str:
+  return sh("pactl", "get-default-sink" if which == "output" else "get-default-source").strip()
+
+
+def selected_device(which: str, state: dict) -> str:
+  """The chosen device, with the @DEFAULT_*@ sentinel resolved to its real name."""
+  name = str(state["devices"].get(which) or "")
+  if name in ("", "@DEFAULT_SINK@", "@DEFAULT_SOURCE@"):
+    return default_name(which) or name
+  return name
+
+
+def cmd_devices(args) -> None:
+  state = load_state()
+  mic_buses = [{"name": MIC_BUS_SOURCE, "description": "Wavemix-Mic"},
+               {"name": STREAM_BUS_SOURCE, "description": "Wavemix-Stream"}]
+  hardware_outputs = hardware_devices("output")
+  hardware_inputs = hardware_devices("input")
+  data = {
+    "outputs": hardware_outputs,
+    "inputs": hardware_inputs,
+    "sources": mic_buses + hardware_inputs,
+    "sinks": hardware_outputs,
+    "selected": {"output": selected_device("output", state),
+                 "input": selected_device("input", state),
+                 "defaultSource": default_name("input"),
+                 "defaultSink": default_name("output")},
+  }
+  if args.json:
+    print(json.dumps(data, indent=2))
+    return
+
+  def dump(title, key, items):
+    print(f"{title} ({len(items)}):")
+    for d in items:
+      mark = "*" if d["name"] == data["selected"].get(key) else " "
+      print(f"  {mark} {d['name']}   {d['description']}")
+
+  dump("engine output", "output", data["outputs"])
+  dump("engine mic", "input", data["inputs"])
+  dump("default source", "defaultSource", data["sources"])
+  dump("default sink", "defaultSink", data["sinks"])
+
+
+def cmd_default(args) -> None:
+  state = load_state()
+  state.setdefault("defaults", {"source": "", "sink": ""})[args.which] = args.name
+  save_state(state)
+  sh("pactl", "set-default-sink" if args.which == "sink" else "set-default-source", args.name)
+  print(f"wavemix: default {args.which} -> {args.name}")
+
+
+def cmd_mutes(args) -> None:
+  state = load_state()
+  print(json.dumps({"output": device_mute("output", state), "input": device_mute("input", state)}))
+
+
+def cmd_mute(args) -> None:
+  state = load_state()
+  which = args.which
+  name = str(state["devices"].get(which, ""))
+  if name == "":
+    sys.exit(f"wavemix: no {which} device selected")
+  sub = "set-sink-mute" if which == "output" else "set-source-mute"
+  sh("pactl", sub, name, {"on": "1", "off": "0", "toggle": "toggle"}[args.action])
+  print(json.dumps({which: device_mute(which, state)}))
+
+
+def cmd_micfx(args) -> None:
+  state = load_state()
+  fx = state.setdefault("micFx", {"enabled": False})
+  if args.action == "on":
+    fx["enabled"] = True
+  elif args.action == "off":
+    fx["enabled"] = False
+  else:
+    fx["enabled"] = not fx.get("enabled", False)
+  with graph_lock():
+    save_state(state)
+    up(state)
+  note = "" if mic_fx_available() else "  (filter-chain fragment missing - see pipewire.conf.d/90-wavemix-micfx.conf)"
+  print(f"wavemix: mic fx {'on' if fx['enabled'] else 'off'}{note}")
+
+
+def cmd_apps(args) -> None:
+  state = load_state()
+  by_index = sink_name_by_index()
+  rows = []
+  for si in app_streams():
+    props = si.get("properties") or {}
+    rows.append({
+      "index": si.get("index"),
+      "app": app_key(si),
+      "binary": str(props.get("application.process.binary") or ""),
+      "channel": app_channel(si, by_index),
+      "volume": volume_percent(si),
+      "muted": bool(si.get("mute")),
+      "rule": state.get("rules", {}).get(app_key(si).lower(), ""),
+    })
+  if args.json:
+    print(json.dumps(rows, indent=2))
+    return
+  if not rows:
+    print("  (no app audio streams right now)")
+    return
+  for row in rows:
+    where = row["channel"] or row["rule"] or "unrouted"
+    print(f"  {row['index']:>6}  {row['app'][:26]:26}  -> {where}")
+
+
+def cmd_route(args) -> None:
+  state = load_state()
+  channel = find_channel(state, args.channel)
+  if channel is None:
+    sys.exit(f"wavemix: no such channel: {args.channel}")
+  if channel.get("source") == "mic":
+    sys.exit("wavemix: apps cannot be routed to a mic channel")
+  want = sink_name(channel["id"])
+
+  numeric = args.target.isdigit()
+  moved = 0
+  keys: set[str] = set()
+  for si in app_streams():
+    props = si.get("properties") or {}
+    if numeric:
+      if str(si.get("index")) != args.target:
+        continue
+    else:
+      names = {app_key(si).lower(), str(props.get("application.process.binary") or "").lower()}
+      if args.target.lower() not in names:
+        continue
+    sh("pactl", "move-sink-input", str(si["index"]), want)
+    moved += 1
+    if app_key(si):
+      keys.add(app_key(si).lower())
+  if not numeric:
+    keys.add(args.target.lower())
+
+  for key in keys:
+    state["rules"][key] = channel["id"]
+  save_state(state)
+  print(f"wavemix: routed {moved} stream(s) to {channel['id']}"
+        + (f"; saved rules: {', '.join(sorted(keys))}" if keys else ""))
+
+
+def cmd_unroute(args) -> None:
+  state = load_state()
+  key = args.target.lower()
+  if key in state.get("rules", {}):
+    channel_id = state["rules"].pop(key)
+    save_state(state)
+    # Move any live streams for this app back to the default sink so it stops
+    # feeding the channel it was assigned to.
+    for si in app_streams():
+      if app_key(si).lower() == key:
+        sh("pactl", "move-sink-input", str(si["index"]), "@DEFAULT_SINK@")
+    print(f"wavemix: removed rule {key} (was -> {channel_id})")
+  else:
+    print(f"wavemix: no rule for {key}")
+
+
+def cmd_rules(args) -> None:
+  state = load_state()
+  rules = state.get("rules", {})
+  if args.json:
+    print(json.dumps(rules, indent=2))
+    return
+  if not rules:
+    print("  (no rules yet - use: wavemix route <app> <channel>)")
+    return
+  for key in sorted(rules):
+    print(f"  {key:26} -> {rules[key]}")
+
+
+def cmd_watch(args) -> None:
+  print("wavemix: watching (Ctrl-C to stop)", flush=True)
+  while True:
+    try:
+      reconcile(load_state())
+    except Exception as exc:  # noqa: BLE001
+      print(f"wavemix: reconcile error: {exc}", file=sys.stderr)
+    time.sleep(2)
+
+
+def build_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(prog="wavemix", description="PipeWire channel mixer")
+  sub = parser.add_subparsers(dest="command", required=True)
+
+  p = sub.add_parser("init", help="write a default state file")
+  p.add_argument("--force", action="store_true")
+  p.set_defaults(func=cmd_init)
+
+  sub.add_parser("up", help="build the graph from state").set_defaults(func=cmd_up)
+  sub.add_parser("down", help="tear the graph down").set_defaults(func=cmd_down)
+  sub.add_parser("restart", help="tear down and rebuild").set_defaults(func=cmd_restart)
+
+  p = sub.add_parser("status", help="show state and live graph")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_status)
+
+  p = sub.add_parser("send", help="change a channel send")
+  p.add_argument("channel")
+  p.add_argument("send", choices=["output", "input"])
+  p.add_argument("action", choices=["on", "off", "toggle", "volume"])
+  p.add_argument("value", nargs="?")
+  p.set_defaults(func=cmd_send)
+
+  p = sub.add_parser("channel", help="add or remove a channel")
+  p.add_argument("action", choices=["add", "remove"])
+  p.add_argument("name", nargs="?")
+  p.add_argument("--mic", action="store_true", help="the new channel is a microphone")
+  p.set_defaults(func=cmd_channel)
+
+  p = sub.add_parser("device", help="choose the physical input/output")
+  p.add_argument("which", choices=["output", "input"])
+  p.add_argument("name")
+  p.set_defaults(func=cmd_device)
+
+  p = sub.add_parser("devices", help="list available output/input devices")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_devices)
+
+  p = sub.add_parser("default", help="set the system default sink or source")
+  p.add_argument("which", choices=["sink", "source"])
+  p.add_argument("name")
+  p.set_defaults(func=cmd_default)
+
+  sub.add_parser("mutes", help="print the output/input mute state as JSON").set_defaults(func=cmd_mutes)
+
+  p = sub.add_parser("mute", help="mute the selected output or input device")
+  p.add_argument("which", choices=["output", "input"])
+  p.add_argument("action", nargs="?", choices=["on", "off", "toggle"], default="toggle")
+  p.set_defaults(func=cmd_mute)
+
+  p = sub.add_parser("micfx", help="toggle the microphone effect chain")
+  p.add_argument("action", nargs="?", choices=["on", "off", "toggle"], default="toggle")
+  p.set_defaults(func=cmd_micfx)
+
+  p = sub.add_parser("apps", help="list app audio streams and their channel")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_apps)
+
+  p = sub.add_parser("route", help="send an app (name or sink-input id) to a channel")
+  p.add_argument("target")
+  p.add_argument("channel")
+  p.set_defaults(func=cmd_route)
+
+  p = sub.add_parser("unroute", help="drop an app's routing rule")
+  p.add_argument("target")
+  p.set_defaults(func=cmd_unroute)
+
+  p = sub.add_parser("rules", help="list routing rules")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_rules)
+
+  sub.add_parser("watch", help="daemon: keep the graph alive and route apps").set_defaults(func=cmd_watch)
+
+  return parser
+
+
+def main() -> int:
+  args = build_parser().parse_args()
+  args.func(args)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

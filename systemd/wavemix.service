@@ -1,0 +1,13 @@
+[Unit]
+Description=Wavemix PipeWire channel mixer
+After=pipewire.service pipewire-pulse.service wireplumber.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wavemix watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1289 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Services.Pipewire
+import qs.Commons
+import qs.Ui
+
+// Wavemix: a bar button and a channel-mixer panel.
+//
+// Each channel has two sends -- output (to your speakers) and input (to the
+// shared virtual mic) -- each with a level fader and an enable check. A channel
+// can be deleted, and apps can be assigned to it (a chip per app). A device
+// section at the bottom picks the physical output and input.
+//
+// The bar itself is a mic icon and a speaker icon: left-click either to mute
+// it, right-click to open the panel. The panel is a view over the `wavemix`
+// CLI: it polls `status --json`, `devices --json` and (only while picking)
+// `apps --json`, and drives `send` / `device` / `channel` / `route` / `unroute`.
+Panel {
+  id: root
+  moduleName: "mnisyif.wavemix"
+  ipcTarget: "mnisyif.wavemix"
+  manageIpc: false
+
+  readonly property string bin: (Quickshell.env("HOME") || "") + "/.local/bin/wavemix"
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  // device mute state (physical output/input), and the bar glyphs for it
+  property var mutes: ({ output: false, input: false })
+  readonly property string micOn: String.fromCodePoint(0xf130) // nf-fa-microphone
+  readonly property string micOff: String.fromCodePoint(0xf131) // nf-fa-microphone_slash
+  readonly property string spkOn: String.fromCodePoint(0xf057e) // nf-md-volume_high
+  readonly property string spkOff: String.fromCodePoint(0xf075f) // nf-md-volume_mute
+  // Icon cell: a touch tighter than a full bar icon slot (the pair sits closer
+  // than two separate widgets).
+  readonly property real iconCell: Style.bar.iconSlot - Style.space(3)
+
+  readonly property string heroGlyph: String.fromCodePoint(0xf1de) // nf-fa-sliders
+  readonly property bool micFxOn: statusData && statusData.micFx ? statusData.micFx.enabled === true : false
+  readonly property var headroom: (statusData && statusData.headroom)
+    ? statusData.headroom : ({ output: 1, input: 1 })
+  // The most aggressive trim across the two send buses; below 1 means the
+  // engine is holding the summed mix under the -1 dBFS headroom target.
+  readonly property real headroomTrim: Math.min(Number(headroom.output) || 1,
+                                                Number(headroom.input) || 1)
+  readonly property string heroStatus: {
+    var cur = deviceCurrent("defaultSource")
+    var list = deviceList("defaultSource")
+    for (var i = 0; i < list.length; i++)
+      if (list[i].name === cur) return "DEFAULT MIC: " + String(list[i].description).toUpperCase()
+    return "DEFAULT MIC: " + String(cur).toUpperCase()
+  }
+  readonly property string tooltipText: "Wavemix — mic "
+    + (mutes.input ? "muted" : "on") + " · speakers " + (mutes.output ? "muted" : "on")
+    + "   (left-click an icon to mute · right-click for panel)"
+
+  property var statusData: null
+  property var devicesData: null
+  property var appData: []
+  property int cursorIndex: 0
+  property string view: "main" // "main" | "pick"
+  property string pickChannel: ""
+  property bool editing: false
+
+  // ---- model ---------------------------------------------------------------
+  readonly property var channelIds: {
+    var g = statusData && statusData.graph ? statusData.graph.channels : null
+    return g ? Object.keys(g) : []
+  }
+  readonly property var rules: (statusData && statusData.rules) ? statusData.rules : ({})
+
+  function channelOf(id) {
+    return statusData && statusData.graph ? statusData.graph.channels[id] : null
+  }
+  function channelName(id) {
+    var c = channelOf(id)
+    return c ? String(c.name) : id
+  }
+  function channelIsMic(id) {
+    var c = channelOf(id)
+    return c ? c.source === "mic" : false
+  }
+  function channelApps(id) {
+    var out = []
+    for (var k in rules) if (rules[k] === id) out.push(k)
+    out.sort()
+    return out
+  }
+  function sendOf(id, send) {
+    var c = channelOf(id)
+    return c ? c.sends[send] : null
+  }
+  function sendOn(id, send) {
+    var s = sendOf(id, send)
+    return s ? s.on === true : false
+  }
+  function sendVol(id, send) {
+    var s = sendOf(id, send)
+    return s ? Number(s.volume) : 0
+  }
+
+  // ---- meters --------------------------------------------------------------
+  // Live peak monitors read the channel's raw audio, before its send faders.
+  // Apps channels have their own null-sink; the mic channel shares the mic bus.
+  readonly property var pwNodes: {
+    var map = ({})
+    var list = Pipewire.nodes ? Pipewire.nodes.values : []
+    for (var i = 0; i < list.length; i++) {
+      var node = list[i]
+      if (node && node.name) map[String(node.name)] = node
+    }
+    return map
+  }
+  function channelPeakNode(id) {
+    if (!id) return null
+    var name = channelIsMic(id) ? "wavemix_micbus" : "wavemix_" + id
+    return pwNodes[name] || null
+  }
+
+  // ---- device helpers ------------------------------------------------------
+  function deviceList(key) {
+    if (!devicesData) return []
+    if (key === "output") return devicesData.outputs || []
+    if (key === "input") return devicesData.inputs || []
+    if (key === "defaultSource") return devicesData.sources || []
+    if (key === "defaultSink") return devicesData.sinks || []
+    return []
+  }
+  function deviceCurrent(key) {
+    if (!devicesData || !devicesData.selected) return ""
+    return devicesData.selected[key] || ""
+  }
+  function deviceLabel(which) {
+    var cur = deviceCurrent(which)
+    var list = deviceList(which)
+    for (var i = 0; i < list.length; i++) if (list[i].name === cur) return String(list[i].description)
+    return cur === "" ? "(none)" : cur
+  }
+  function deviceOptions(key) {
+    return deviceList(key).map(function(d) { return { value: d.name, label: d.description } })
+  }
+  function setDevice(key, name) {
+    var cmd = deviceCommand(key, name)
+    if (cmd) { run(cmd); refreshSoon() }
+  }
+  function dropdownFor(key) {
+    if (key === "output") return ddOutput
+    if (key === "input") return ddInput
+    if (key === "defaultSource") return ddDefaultSource
+    if (key === "defaultSink") return ddDefaultSink
+    return null
+  }
+  function openDeviceDropdown(key) {
+    var d = dropdownFor(key)
+    if (d) d.toggle()
+  }
+
+  readonly property bool dropdownOpen: ddOutput.popupOpen || ddInput.popupOpen
+    || ddDefaultSource.popupOpen || ddDefaultSink.popupOpen
+
+  // ---- control lists -------------------------------------------------------
+  readonly property var controls: {
+    var list = []
+    list.push({ kind: "mute", which: "input" })
+    list.push({ kind: "mute", which: "output" })
+    list.push({ kind: "micfx" })
+    for (var i = 0; i < channelIds.length; i++) {
+      var id = channelIds[i]
+      var apps = channelApps(id)
+      list.push({ kind: "send", channel: id, send: "output" })
+      list.push({ kind: "send", channel: id, send: "input" })
+      for (var j = 0; j < apps.length; j++) list.push({ kind: "app", channel: id, app: apps[j] })
+      list.push({ kind: "addapp", channel: id })
+      list.push({ kind: "delete", channel: id })
+    }
+    list.push({ kind: "add" })
+    list.push({ kind: "device", key: "output" })
+    list.push({ kind: "device", key: "input" })
+    list.push({ kind: "device", key: "defaultSource" })
+    list.push({ kind: "device", key: "defaultSink" })
+    return list
+  }
+
+  readonly property var pickApps: {
+    var seen = ({})
+    var out = []
+    function add(name) {
+      var n = String(name || "")
+      if (n === "") return
+      var k = n.toLowerCase()
+      if (seen[k]) return
+      seen[k] = true
+      out.push({ name: n, channel: String(root.rules[k] || "") })
+    }
+    for (var i = 0; i < appData.length; i++) add(appData[i].app)
+    for (var k in root.rules) add(k)
+    out.sort(function(a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1 })
+    return out
+  }
+
+  readonly property var pickControls: {
+    var list = []
+    for (var i = 0; i < pickApps.length; i++) list.push({ kind: "pickapp", app: pickApps[i].name })
+    return list
+  }
+
+  readonly property var activeControls: view === "pick" ? pickControls : controls
+
+  function findControl(parts) {
+    for (var i = 0; i < activeControls.length; i++) {
+      var c = activeControls[i]
+      var ok = true
+      for (var key in parts) if (c[key] !== parts[key]) ok = false
+      if (ok) return i
+    }
+    return -1
+  }
+  readonly property int ctlMic: findControl({ kind: "mute", which: "input" })
+  readonly property int ctlSpk: findControl({ kind: "mute", which: "output" })
+  readonly property int ctlMicFx: findControl({ kind: "micfx" })
+  readonly property int ctlAdd: controls.length - 5
+  readonly property int ctlOutput: controls.length - 4
+  readonly property int ctlInput: controls.length - 3
+  readonly property int ctlDefaultSource: controls.length - 2
+  readonly property int ctlDefaultSink: controls.length - 1
+
+  // ---- commands ------------------------------------------------------------
+  property var queue: []
+
+  function run(args) {
+    queue = queue.concat([args])
+    pump()
+  }
+  function pump() {
+    if (cmd.running || queue.length === 0) return
+    var next = queue[0]
+    queue = queue.slice(1)
+    cmd.command = [root.bin].concat(next)
+    cmd.running = true
+  }
+  function refreshSoon() { settle.restart() }
+
+  function setVolume(id, send, value) {
+    run(["send", id, send, "volume", String(Math.max(0, Math.min(100, Math.round(value))))])
+    refreshSoon()
+  }
+  function toggleSend(id, send) {
+    run(["send", id, send, sendOn(id, send) ? "off" : "on"])
+    refreshSoon()
+  }
+  function addChannel() {
+    run(["channel", "add", "Channel " + (channelIds.length + 1)])
+    run(["up"])
+    refreshSoon()
+  }
+  function deleteChannel(id) {
+    run(["channel", "remove", id])
+    run(["up"])
+    refreshSoon()
+  }
+  function deviceCommand(key, name) {
+    if (key === "output") return ["device", "output", name]
+    if (key === "input") return ["device", "input", name]
+    if (key === "defaultSource") return ["default", "source", name]
+    if (key === "defaultSink") return ["default", "sink", name]
+    return null
+  }
+  function cycleDevice(key, dir) {
+    var list = deviceList(key)
+    if (list.length < 2) return
+    var cur = deviceCurrent(key)
+    var at = 0
+    for (var i = 0; i < list.length; i++) if (list[i].name === cur) at = i
+    var cmd = deviceCommand(key, list[(at + dir + list.length) % list.length].name)
+    if (cmd) { run(cmd); refreshSoon() }
+  }
+  function openPicker(id) {
+    pickChannel = id
+    view = "pick"
+    cursorIndex = 0
+    refreshApps()
+  }
+  function closePicker() { view = "main" }
+  function assignApp(app, id) {
+    if (!app || !id) return
+    run(["route", app, id])
+    refreshSoon()
+    view = "main"
+  }
+  function unrouteApp(app) {
+    run(["unroute", app])
+    refreshSoon()
+  }
+
+  // ---- cursor --------------------------------------------------------------
+  function clampCursor() {
+    var n = activeControls.length
+    cursorIndex = n === 0 ? 0 : Math.max(0, Math.min(n - 1, cursorIndex))
+  }
+  onControlsChanged: root.clampCursor()
+  onActiveControlsChanged: root.clampCursor()
+
+  function moveCursor(dx, dy) {
+    var list = activeControls
+    if (list.length === 0) return
+    if (dy !== 0) {
+      cursorIndex = Math.max(0, Math.min(list.length - 1, cursorIndex + dy))
+      return
+    }
+    if (dx === 0) return
+    var c = list[cursorIndex]
+    if (!c) return
+    if (c.kind === "send") setVolume(c.channel, c.send, sendVol(c.channel, c.send) + dx * 5)
+  }
+
+  function activate() {
+    var c = activeControls[cursorIndex]
+    if (!c) return
+    if (c.kind === "send") toggleSend(c.channel, c.send)
+    else if (c.kind === "add") addChannel()
+    else if (c.kind === "delete") deleteChannel(c.channel)
+    else if (c.kind === "app") unrouteApp(c.app)
+    else if (c.kind === "addapp") openPicker(c.channel)
+    else if (c.kind === "mute") root.toggleMute(c.which)
+    else if (c.kind === "micfx") root.toggleMicFx()
+    else if (c.kind === "device") root.openDeviceDropdown(c.key)
+    else if (c.kind === "pickapp") assignApp(c.app, pickChannel)
+  }
+
+  // ---- polling -------------------------------------------------------------
+  function refresh() { if (!statusProc.running) statusProc.running = true }
+  function refreshDevices() { if (!devicesProc.running) devicesProc.running = true }
+  function refreshApps() { if (!appsProc.running) appsProc.running = true }
+  function refreshMutes() { if (!mutesProc.running) mutesProc.running = true }
+  function toggleMute(which) {
+    run(["mute", which, "toggle"])
+    refreshSoon()
+    Qt.callLater(root.refreshMutes)
+  }
+  function toggleMicFx() {
+    run(["micfx", "toggle"])
+    refreshSoon()
+  }
+
+  implicitWidth: icons.implicitWidth
+  implicitHeight: icons.implicitHeight
+
+  onOpenedChanged: {
+    if (opened) {
+      view = "main"
+      cursorIndex = 0
+      editing = false
+      refresh()
+      refreshDevices()
+    }
+  }
+
+  IpcHandler {
+    target: "mnisyif.wavemix"
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.refresh(); root.refreshDevices() }
+    function mute(which: string): void { root.toggleMute(which) }
+  }
+
+  Process {
+    id: statusProc
+    command: [root.bin, "status", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.statusData = JSON.parse(text) } catch (e) {} }
+    }
+  }
+
+  Process {
+    id: devicesProc
+    command: [root.bin, "devices", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.devicesData = JSON.parse(text) } catch (e) {} }
+    }
+  }
+
+  Process {
+    id: appsProc
+    command: [root.bin, "apps", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.appData = JSON.parse(text) } catch (e) {} }
+    }
+  }
+
+  Process {
+    id: mutesProc
+    command: [root.bin, "mutes"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.mutes = JSON.parse(text) } catch (e) {} }
+    }
+  }
+
+  Process {
+    id: cmd
+    onRunningChanged: if (!running) root.pump()
+  }
+
+  Timer {
+    id: settle
+    interval: 250
+    repeat: false
+    onTriggered: { root.refresh(); root.refreshDevices(); root.refreshMutes() }
+  }
+
+  Timer {
+    interval: 1500
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshMutes()
+  }
+
+  Timer {
+    interval: 1000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    interval: 1000
+    running: root.opened && root.view === "pick"
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshApps()
+  }
+
+  // Two independent icon buttons so the bar routes a click to the one under
+  // the cursor (a plain MouseArea inside one widget never sees the click - the
+  // bar dispatches to registered click targets by position).
+  Row {
+    id: icons
+    anchors.centerIn: parent
+    spacing: 0
+
+    WidgetButton {
+      id: micButton
+      bar: root.bar
+      labelVisible: true
+      text: root.mutes.input ? root.micOff : root.micOn
+      fontSize: Style.bar.iconFont
+      foreground: root.mutes.input ? Qt.darker(root.foreground, 1.7) : root.foreground
+      fixedWidth: root.iconCell
+      tooltipText: "Microphone - left-click to mute, right-click for the panel"
+      onPressed: function(buttonCode) {
+        if (buttonCode === Qt.RightButton) root.toggle()
+        else if (buttonCode === Qt.LeftButton) root.toggleMute("input")
+      }
+    }
+
+    WidgetButton {
+      id: spkButton
+      bar: root.bar
+      labelVisible: true
+      text: root.mutes.output ? root.spkOff : root.spkOn
+      fontSize: Style.bar.iconFont
+      foreground: root.mutes.output ? Qt.darker(root.foreground, 1.7) : root.foreground
+      fixedWidth: root.iconCell
+      tooltipText: "Speakers - left-click to mute, right-click for the panel"
+      onPressed: function(buttonCode) {
+        if (buttonCode === Qt.RightButton) root.toggle()
+        else if (buttonCode === Qt.LeftButton) root.toggleMute("output")
+      }
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: icons
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(520))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: root.editing || root.dropdownOpen
+      onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
+      onActivateRequested: root.activate()
+      onCloseRequested: { if (root.view === "pick") root.closePicker(); else root.close() }
+      onTextKey: function(t) { if (t === "b" || t === "B") { if (root.view === "pick") root.closePicker() } }
+
+      Flickable {
+        id: flick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        Column {
+          id: column
+          width: flick.width
+          spacing: Style.space(10)
+
+          // ---------------- main ----------------
+          Column {
+            width: parent.width
+            spacing: Style.space(10)
+            visible: root.view === "main"
+
+            // ---------- Hero: icon · title/status · mute switches ----------
+            Item {
+              id: hero
+              width: parent.width
+              implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight,
+                                       heroSwitches.implicitHeight)
+
+              Text {
+                id: heroIcon
+                text: root.heroGlyph
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.display
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Row {
+                id: heroSwitches
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(12)
+
+                ToggleSwitch {
+                  id: micSwitch
+                  checked: !root.mutes.input
+                  hasCursor: root.view === "main" && root.cursorIndex === root.ctlMic
+                  foreground: root.foreground
+                  onHovered: function(on) { if (on) root.cursorIndex = root.ctlMic }
+                  onToggled: root.toggleMute("input")
+
+                  PanelToolTip {
+                    visible: micSwitch.containsMouse
+                    text: "Microphone - " + (root.mutes.input ? "muted" : "on")
+                    fontFamily: root.fontFamily
+                  }
+                }
+
+                ToggleSwitch {
+                  id: spkSwitch
+                  checked: !root.mutes.output
+                  hasCursor: root.view === "main" && root.cursorIndex === root.ctlSpk
+                  foreground: root.foreground
+                  onHovered: function(on) { if (on) root.cursorIndex = root.ctlSpk }
+                  onToggled: root.toggleMute("output")
+
+                  PanelToolTip {
+                    visible: spkSwitch.containsMouse
+                    text: "Speakers - " + (root.mutes.output ? "muted" : "on")
+                    fontFamily: root.fontFamily
+                  }
+                }
+              }
+
+              Column {
+                id: heroLabels
+                anchors.left: heroIcon.right
+                anchors.leftMargin: Style.space(14)
+                anchors.right: heroSwitches.left
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  text: "Wavemix"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  elide: Text.ElideRight
+                  width: parent.width
+                }
+
+                Text {
+                  text: root.heroStatus
+                  color: Qt.darker(root.foreground, 1.4)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.2
+                  elide: Text.ElideRight
+                  width: parent.width
+                }
+              }
+            }
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: "MIC FX"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            FxRow {
+              width: parent.width
+              controlIndex: root.ctlMicFx
+            }
+
+            PanelSeparator { foreground: root.foreground }
+
+            Text {
+              width: parent.width
+              visible: root.headroomTrim < 0.999
+              text: "AUTO HEADROOM  -" + (20 * Math.log10(1 / root.headroomTrim)).toFixed(1) + " dB"
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+            }
+
+            Text {
+              visible: root.channelIds.length === 0
+              text: root.statusData ? "No channels." : "Loading…"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            Repeater {
+              model: root.channelIds
+
+              ChannelBlock {
+                required property string modelData
+                required property int index
+                width: column.width
+                channelId: modelData
+                channelIndex: index
+              }
+            }
+
+            AddRow {
+              width: parent.width
+              controlIndex: root.ctlAdd
+            }
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: "DEVICES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Dropdown {
+              id: ddOutput
+              width: parent.width
+              label: "Output"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: root.deviceOptions("output")
+              value: root.deviceCurrent("output")
+              hasCursor: root.view === "main" && root.cursorIndex === root.ctlOutput
+              onHovered: function(h) { if (h) root.cursorIndex = root.ctlOutput }
+              onChanged: function(v) { root.setDevice("output", v) }
+            }
+
+            Dropdown {
+              id: ddInput
+              width: parent.width
+              label: "Mic"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: root.deviceOptions("input")
+              value: root.deviceCurrent("input")
+              hasCursor: root.view === "main" && root.cursorIndex === root.ctlInput
+              onHovered: function(h) { if (h) root.cursorIndex = root.ctlInput }
+              onChanged: function(v) { root.setDevice("input", v) }
+            }
+
+            Dropdown {
+              id: ddDefaultSource
+              width: parent.width
+              label: "Default mic"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: root.deviceOptions("defaultSource")
+              value: root.deviceCurrent("defaultSource")
+              hasCursor: root.view === "main" && root.cursorIndex === root.ctlDefaultSource
+              onHovered: function(h) { if (h) root.cursorIndex = root.ctlDefaultSource }
+              onChanged: function(v) { root.setDevice("defaultSource", v) }
+            }
+
+            Dropdown {
+              id: ddDefaultSink
+              width: parent.width
+              label: "Default out"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: root.deviceOptions("defaultSink")
+              value: root.deviceCurrent("defaultSink")
+              hasCursor: root.view === "main" && root.cursorIndex === root.ctlDefaultSink
+              onHovered: function(h) { if (h) root.cursorIndex = root.ctlDefaultSink }
+              onChanged: function(v) { root.setDevice("defaultSink", v) }
+            }
+
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: "j/k  move   ·   h/l  level / device   ·   Enter  toggle / open   ·   Esc  close"
+              color: Qt.darker(root.foreground, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+
+          // ---------------- picker ----------------
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.view === "pick"
+
+            PanelSectionHeader {
+              text: "ADD APP TO " + root.channelName(root.pickChannel)
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            TextField {
+              id: nameField
+              width: parent.width
+              placeholderText: "Type an app name (e.g. firefox)"
+              foreground: root.foreground
+              font.family: root.fontFamily
+              onAccepted: { root.assignApp(text, root.pickChannel); text = "" }
+              Keys.onEscapePressed: { root.editing = false; keyCatcher.forceActiveFocus() }
+              onActiveFocusChanged: root.editing = activeFocus
+            }
+
+            Text {
+              width: parent.width
+              text: "Playing now / known apps:"
+              color: Qt.darker(root.foreground, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: root.pickApps.length === 0
+              text: "(nothing playing - type a name above)"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Repeater {
+              model: root.pickApps
+
+              PickRow {
+                required property var modelData
+                required property int index
+                width: column.width
+                appName: modelData.name
+                currentChannel: modelData.channel
+                controlIndex: index
+              }
+            }
+
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: "j/k  move   ·   Enter  assign   ·   Esc  back"
+              color: Qt.darker(root.foreground, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- components
+
+  component CheckBox: Item {
+    id: box
+    property bool checked: false
+    signal toggled()
+
+    implicitWidth: Style.space(16)
+    implicitHeight: Style.space(16)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.space(2)
+      color: "transparent"
+      border.width: Math.max(1, Style.space(1))
+      border.color: root.foreground
+    }
+
+    Rectangle {
+      anchors.centerIn: parent
+      width: parent.width * 0.55
+      height: parent.height * 0.55
+      radius: Style.space(1)
+      color: root.foreground
+      visible: box.checked
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: box.toggled()
+    }
+  }
+
+  component ChannelMeter: Item {
+    id: meter
+    property real level: 0
+    property real held: 0
+
+    implicitHeight: Math.max(Style.space(3), 3)
+
+    onLevelChanged: {
+      if (level >= held) {
+        held = level
+        holdTimer.restart()
+        decayTimer.stop()
+      }
+    }
+
+    Rectangle {
+      id: meterTrack
+      anchors.fill: parent
+      radius: height / 2
+      color: Util.alpha(root.foreground, 0.18)
+      clip: true
+
+      Rectangle {
+        height: parent.height
+        width: parent.width * Math.max(0, Math.min(1, meter.level))
+        radius: height / 2
+        color: root.foreground
+        Behavior on width { NumberAnimation { duration: Style.duration(70) } }
+      }
+    }
+
+    // Peak hold: stays put briefly, then falls back to the live level.
+    Rectangle {
+      visible: meter.held > 0.01
+      width: Math.max(Style.space(2), 2)
+      height: parent.height
+      radius: width / 2
+      color: root.foreground
+      x: Math.max(0, Math.min(meterTrack.width - width,
+                               meterTrack.width * Math.max(0, Math.min(1, meter.held)) - width / 2))
+    }
+
+    Timer {
+      id: holdTimer
+      interval: 700
+      repeat: false
+      onTriggered: decayTimer.restart()
+    }
+
+    Timer {
+      id: decayTimer
+      interval: 40
+      repeat: true
+      onTriggered: {
+        meter.held = Math.max(meter.level, meter.held - 0.02)
+        if (meter.held <= meter.level) {
+          meter.held = meter.level
+          decayTimer.stop()
+        }
+      }
+    }
+  }
+
+  component SendRow: CursorSurface {
+    id: row
+    property string channelId: ""
+    property string sendName: "output"
+    property int controlIndex: 0
+
+    readonly property bool on: root.sendOn(channelId, sendName)
+    readonly property int volume: root.sendVol(channelId, sendName)
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitHeight: slider.implicitHeight + Style.space(4)
+
+    Row {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      CheckBox {
+        anchors.verticalCenter: parent.verticalCenter
+        checked: row.on
+        onToggled: root.toggleSend(row.channelId, row.sendName)
+      }
+
+      Text {
+        width: Style.space(46)
+        anchors.verticalCenter: parent.verticalCenter
+        text: row.sendName === "output" ? "out" : "stream"
+        color: row.on ? root.foreground : Qt.darker(root.foreground, 1.7)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      PanelSlider {
+        id: slider
+        width: parent.width - (Style.space(16) + Style.space(46) + Style.space(38) + parent.spacing * 3)
+        anchors.verticalCenter: parent.verticalCenter
+        bar: root.bar
+        minimum: 0
+        maximum: 100
+        step: 5
+        integer: true
+        value: row.volume
+        onReleased: function(v) { root.setVolume(row.channelId, row.sendName, v) }
+      }
+
+      Text {
+        width: Style.space(38)
+        anchors.verticalCenter: parent.verticalCenter
+        horizontalAlignment: Text.AlignRight
+        text: (slider.dragging ? Math.round(slider.liveValue) : row.volume) + "%"
+        color: row.on ? root.foreground : Qt.darker(root.foreground, 1.7)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = row.controlIndex
+    }
+  }
+
+  component ChannelBlock: Column {
+    id: block
+    property string channelId: ""
+    property int channelIndex: 0
+
+    width: parent ? parent.width : 0
+    spacing: Style.space(4)
+
+    readonly property var apps: root.channelApps(block.channelId)
+    readonly property int deleteIndex: root.findControl({ kind: "delete", channel: block.channelId })
+    readonly property int addAppIndex: root.findControl({ kind: "addapp", channel: block.channelId })
+    readonly property var peakNode: root.channelPeakNode(block.channelId)
+
+    PwNodePeakMonitor {
+      id: channelPeak
+      node: block.peakNode
+      enabled: root.opened
+    }
+
+    // header: name · source · delete
+    Item {
+      width: parent.width
+      height: Math.max(nameText.implicitHeight, deleteText.implicitHeight)
+
+      Text {
+        id: nameText
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.channelName(block.channelId)
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+      }
+
+      Text {
+        anchors.right: deleteText.left
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.channelIsMic(block.channelId) ? "microphone" : "apps"
+        color: Qt.darker(root.foreground, 1.6)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        id: deleteText
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: String.fromCodePoint(0xf00d) // nf-fa-times
+        color: deleteArea.containsMouse ? Color.urgent : Qt.darker(root.foreground, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+
+        MouseArea {
+          id: deleteArea
+          anchors.fill: parent
+          anchors.margins: -Style.space(5)
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onContainsMouseChanged: if (containsMouse) root.cursorIndex = block.deleteIndex
+          onClicked: root.deleteChannel(block.channelId)
+        }
+      }
+    }
+
+    ChannelMeter {
+      width: parent.width
+      level: channelPeak.peak
+    }
+
+    SendRow {
+      width: parent.width
+      channelId: block.channelId
+      sendName: "output"
+      controlIndex: root.findControl({ kind: "send", channel: block.channelId, send: "output" })
+    }
+
+    SendRow {
+      width: parent.width
+      channelId: block.channelId
+      sendName: "input"
+      controlIndex: root.findControl({ kind: "send", channel: block.channelId, send: "input" })
+    }
+
+    // apps assigned to this channel
+    Row {
+      width: parent.width
+      spacing: Style.space(6)
+
+      Repeater {
+        model: block.apps
+
+        AppChip {
+          required property string modelData
+          app: modelData
+          controlIndex: root.findControl({ kind: "app", channel: block.channelId, app: modelData })
+        }
+      }
+
+      AddAppChip {
+        controlIndex: block.addAppIndex
+        channelId: block.channelId
+      }
+    }
+  }
+
+  component AppChip: CursorSurface {
+    id: chip
+    property string app: ""
+    property int controlIndex: 0
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitWidth: chipText.implicitWidth + Style.space(16)
+    implicitHeight: chipText.implicitHeight + Style.space(6)
+    outline: true
+
+    Text {
+      id: chipText
+      anchors.centerIn: parent
+      text: chip.app + "  " + String.fromCodePoint(0xf00d)
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = chip.controlIndex
+      onClicked: root.unrouteApp(chip.app)
+    }
+  }
+
+  component AddAppChip: CursorSurface {
+    id: addApp
+    property int controlIndex: 0
+    property string channelId: ""
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitWidth: addAppText.implicitWidth + Style.space(16)
+    implicitHeight: addAppText.implicitHeight + Style.space(6)
+    outline: true
+
+    Text {
+      id: addAppText
+      anchors.centerIn: parent
+      text: "+ app"
+      color: Qt.darker(root.foreground, 1.4)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = addApp.controlIndex
+      onClicked: root.openPicker(addApp.channelId)
+    }
+  }
+
+  component FxRow: CursorSurface {
+    id: fxRow
+    property int controlIndex: 0
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitHeight: fxLabel.implicitHeight + Style.space(10)
+
+    Text {
+      id: fxLabel
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      text: "Noise suppression"
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    ToggleSwitch {
+      id: fxSwitch
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      interactive: false
+      checked: root.micFxOn
+      hasCursor: root.view === "main" && root.cursorIndex === fxRow.controlIndex
+      foreground: root.foreground
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = fxRow.controlIndex
+      onClicked: root.toggleMicFx()
+    }
+  }
+
+  component AddRow: CursorSurface {
+    id: addRow
+    property int controlIndex: 0
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitHeight: addText.implicitHeight + Style.space(8)
+
+    Text {
+      id: addText
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      text: "+  Add channel"
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = addRow.controlIndex
+      onClicked: root.addChannel()
+    }
+  }
+
+  component PickerRow: CursorSurface {
+    id: picker
+    property string deviceKey: "output"
+    property string label: ""
+    property int controlIndex: 0
+
+    readonly property var list: root.deviceList(deviceKey)
+    readonly property bool canCycle: list.length > 1
+
+    hasCursor: root.view === "main" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitHeight: pickerRow.implicitHeight + Style.space(8)
+
+    Row {
+      id: pickerRow
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      Text {
+        width: Style.space(74)
+        text: picker.label
+        color: Qt.darker(root.foreground, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        width: parent.width - Style.space(74) - Style.space(40) - parent.spacing * 2
+        text: root.deviceLabel(picker.deviceKey)
+        elide: Text.ElideRight
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        width: Style.space(40)
+        horizontalAlignment: Text.AlignRight
+        visible: picker.canCycle
+        text: "◂ ▸"
+        color: Qt.darker(root.foreground, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: picker.canCycle ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = picker.controlIndex
+      onClicked: root.cycleDevice(picker.deviceKey, 1)
+    }
+  }
+
+  component PickRow: CursorSurface {
+    id: pick
+    property string appName: ""
+    property string currentChannel: ""
+    property int controlIndex: 0
+
+    hasCursor: root.view === "pick" && root.cursorIndex === controlIndex
+    foreground: root.foreground
+    implicitHeight: pickName.implicitHeight + Style.space(8)
+
+    Text {
+      id: pickName
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      text: pick.appName
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(6)
+      anchors.verticalCenter: parent.verticalCenter
+      text: pick.currentChannel === "" ? "unassigned" : root.channelName(pick.currentChannel)
+      color: Qt.darker(root.foreground, 1.6)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: if (containsMouse) root.cursorIndex = pick.controlIndex
+      onClicked: root.assignApp(pick.appName, root.pickChannel)
+    }
+  }
+}
