@@ -29,6 +29,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import wavemix_fx as fx
+
 STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "wavemix"
 STATE_FILE = STATE_DIR / "state.json"
 LEGACY_STATE_FILE = STATE_DIR.parent / "wavelink" / "state.json"
@@ -1066,6 +1069,7 @@ def cmd_watch(args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(prog="wavemix", description="PipeWire channel mixer")
+  parser.add_argument("--version", action="version", version=f"wavemix {fx.WAVEMIX_VERSION}")
   sub = parser.add_subparsers(dest="command", required=True)
 
   p = sub.add_parser("init", help="write a default state file")

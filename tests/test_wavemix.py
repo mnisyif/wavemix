@@ -1,5 +1,7 @@
 import importlib.machinery
 import importlib.util
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,30 @@ LOADER = importlib.machinery.SourceFileLoader("wavemix", str(ROOT / "bin" / "wav
 SPEC = importlib.util.spec_from_loader("wavemix", LOADER)
 wavemix = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(wavemix)
+
+sys.path.insert(0, str(ROOT / "bin"))
+import wavemix_fx
+
+
+class VersionTests(unittest.TestCase):
+  def test_version_file_matches_module_constant(self):
+    self.assertEqual((ROOT / "VERSION").read_text().strip(), wavemix_fx.WAVEMIX_VERSION)
+
+  def test_parse_version_accepts_numeric_triples(self):
+    self.assertEqual(wavemix_fx.parse_version("1.2.3"), (1, 2, 3))
+    self.assertIsNone(wavemix_fx.parse_version("1.2"))
+    self.assertIsNone(wavemix_fx.parse_version("v1.2.3"))
+
+  def test_version_at_least(self):
+    self.assertTrue(wavemix_fx.version_at_least("1.2.0", "1.1.9"))
+    self.assertTrue(wavemix_fx.version_at_least("1.1.0", "1.1.0"))
+    self.assertFalse(wavemix_fx.version_at_least("1.0.9", "1.1.0"))
+
+  def test_cli_version_output(self):
+    out = subprocess.run(
+      [sys.executable, str(ROOT / "bin" / "wavemix"), "--version"],
+      capture_output=True, text=True, check=True)
+    self.assertEqual(out.stdout.strip(), f"wavemix {wavemix_fx.WAVEMIX_VERSION}")
 
 
 PW_CLI_PROPS = """
