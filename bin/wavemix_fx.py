@@ -704,6 +704,107 @@ def node_for_instance(state: dict, manifests: dict[str, dict],
   return None
 
 
+def first_instance_of(state: dict, plugin_id: str) -> dict | None:
+  """The first chain entry for one plugin id, bypassed or not."""
+  chain = _read_chain(state)
+  if chain is None:
+    return None
+  for instance in chain:
+    if isinstance(instance, dict) and instance.get("plugin") == plugin_id:
+      return instance
+  return None
+
+
+# --------------------------------------------------------------- live controls
+
+_CAPTURE_NODE_NAME = "wavemix_micfx.capture"
+
+
+def parse_control_params(text: str) -> dict[str, float | int]:
+  """Read `fxN:param` values from `pw-cli enum-params` output."""
+  values: dict[str, float | int] = {}
+  lines = str(text or "").splitlines()
+  for i, line in enumerate(lines):
+    match = re.search(r'String "([^"]+:[^"]+)"', line)
+    if not match:
+      continue
+    key = match.group(1)
+    for value_line in lines[i + 1:i + 4]:
+      value = re.match(r"\s*(Int|Float)\s+([-+0-9.eE]+)", value_line)
+      if not value:
+        continue
+      number = float(value.group(2))
+      values[key] = int(number) if value.group(1) == "Int" else number
+      break
+  return values
+
+
+def find_capture_node_id(run) -> int | None:
+  """The PipeWire object id of the filter-chain's capture node."""
+  try:
+    nodes = json.loads(run("pw-dump") or "[]")
+  except (json.JSONDecodeError, TypeError, ValueError):
+    return None
+  if not isinstance(nodes, list):
+    return None
+  for node in nodes:
+    if not isinstance(node, dict):
+      continue
+    info = node.get("info")
+    if not isinstance(info, dict):
+      continue
+    props = info.get("props")
+    if not isinstance(props, dict) or props.get("node.name") != _CAPTURE_NODE_NAME:
+      continue
+    try:
+      return int(node.get("id"))
+    except (TypeError, ValueError):
+      return None
+  return None
+
+
+def live_control_values(run, node_id: int) -> dict[str, float | int]:
+  """Live `fxN:param` values for one filter-chain Props param."""
+  return parse_control_params(
+    run("pw-cli", "enum-params", str(node_id), "Props"))
+
+
+def _live_raw_text(raw, control: dict) -> str:
+  number = float(raw)
+  if control.get("raw_float") or not number.is_integer():
+    return f"{number:.6f}"
+  return str(int(round(number)))
+
+
+def set_live_control(run, node_id: int, node: str, control: dict, raw) -> None:
+  """Set one raw control value on the live filter-chain node."""
+  payload = '{ params = [%s %s] }' % (
+    _spa_quote(f"{node}:{control['param']}"), _live_raw_text(raw, control))
+  run("pw-cli", "set-param", str(node_id), "Props", payload)
+
+
+def apply_chain_controls(run, node_id: int | None, state: dict,
+                         manifests: dict[str, dict]) -> int:
+  """Push stored control values onto a live node, returning how many applied."""
+  if node_id is None:
+    return 0
+  applied = 0
+  for entry in enabled_instances(state, manifests):
+    stored = entry["instance"].get("controls")
+    if not isinstance(stored, dict):
+      continue
+    for control in entry["manifest"].get("controls", []):
+      if not isinstance(control, dict) or not control.get("param"):
+        continue
+      key = control.get("key")
+      if key not in stored:
+        continue
+      raw = _control_raw(stored[key], control)
+      set_live_control(run, node_id, entry["node"], control, raw)
+      applied += 1
+  return applied
+
+
 # ------------------------------------------------------------------- compiler
 
 GENERATED_MARKER = (

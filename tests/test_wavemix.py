@@ -1,5 +1,7 @@
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -476,179 +478,239 @@ class CompilerTests(unittest.TestCase):
         self.state_with_rnnoise, self.manifests, "1.1.0", path))
 
 
-PW_CLI_PROPS = """
-Object: size 288, type Spa:Pod:Object:Param:Props (262146), id Spa:Enum:ParamId:Props (2)
-  Prop: key Spa:Pod:Object:Param:Props:params (524289), flags 00000000
-    Struct: size 264
-      String "rnnoise:VAD Threshold (%)"
+SAMPLE_PARAMS = """
+      String "fx0:VAD Threshold (%)"
       Int 50
-      String "rnnoise:VAD Grace Period (ms)"
-      Int 200
-      String "rnnoise:Retroactive VAD Grace (ms)"
-      Int 0
-      String "rnnoise:Placeholder"
-      Float 170141173319264429905852091742258462720.000000
-      String "rnnoise:Dry Mix"
-      Float 0.000000
+      String "fx0:Dry Mix"
+      Float 0.250000
+      String "fx1:Freq"
+      Float 80.000000
 """
 
 
-def control(key):
-  return next(spec for spec in wavemix.MICFX_CONTROLS if spec["key"] == key)
+class LiveControlTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls._user_dir = tempfile.TemporaryDirectory()
+    cls.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    # Keep the suite hermetic: pretend the RNNoise LADSPA is installed even
+    # when this host does not have it.
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
 
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
 
-class ParseTests(unittest.TestCase):
-  def test_reads_integer_and_float_controls(self):
-    values = wavemix.parse_micfx_params(PW_CLI_PROPS)
+  def test_parse_control_params_keeps_node_prefix(self):
+    values = wavemix_fx.parse_control_params(SAMPLE_PARAMS)
+    self.assertEqual(values["fx0:VAD Threshold (%)"], 50)
+    self.assertEqual(values["fx0:Dry Mix"], 0.25)
+    self.assertEqual(values["fx1:Freq"], 80.0)
 
-    self.assertEqual(values["VAD Threshold (%)"], 50)
-    self.assertEqual(values["VAD Grace Period (ms)"], 200)
-    self.assertEqual(values["Retroactive VAD Grace (ms)"], 0)
-    self.assertEqual(values["Dry Mix"], 0.0)
-    self.assertIsInstance(values["Dry Mix"], float)
-
-  def test_ignores_unrelated_properties(self):
-    text = PW_CLI_PROPS + '\n      String "channelmix.normalize"\n      Bool false\n'
-    values = wavemix.parse_micfx_params(text)
-
+  def test_parse_control_params_ignores_params_without_a_node(self):
+    text = SAMPLE_PARAMS + '\n      String "channelmix.normalize"\n      Bool false\n'
+    values = wavemix_fx.parse_control_params(text)
     self.assertNotIn("channelmix.normalize", values)
 
-  def test_returns_empty_for_empty_input(self):
-    self.assertEqual(wavemix.parse_micfx_params(""), {})
+  def test_find_capture_node_id(self):
+    def run(*args):
+      self.assertEqual(args, ("pw-dump",))
+      return '[{"id": 34, "info": {"props": {"node.name": "wavemix_micfx.capture"}}}]'
+    self.assertEqual(wavemix_fx.find_capture_node_id(run), 34)
+
+  def test_find_capture_node_id_returns_none_when_missing(self):
+    self.assertIsNone(wavemix_fx.find_capture_node_id(lambda *args: "[]"))
+    self.assertIsNone(wavemix_fx.find_capture_node_id(lambda *args: "not json"))
+
+  def test_live_control_values_requests_the_props_param(self):
+    calls = []
+    def run(*args):
+      calls.append(args)
+      return SAMPLE_PARAMS
+    values = wavemix_fx.live_control_values(run, 34)
+    self.assertEqual(calls[0], ("pw-cli", "enum-params", "34", "Props"))
+    self.assertEqual(values["fx0:Dry Mix"], 0.25)
+
+  def test_set_live_control_quotes_param_and_formats_raw(self):
+    calls = []
+    def run(*args): calls.append(args)
+    control = {"param": "Dry Mix", "integer": True, "raw_float": True, "scale": 100}
+    wavemix_fx.set_live_control(run, 34, "fx0", control, 0.25)
+    self.assertEqual(calls[0][:4], ("pw-cli", "set-param", "34", "Props"))
+    self.assertIn('"fx0:Dry Mix" 0.250000', calls[0][4])
+
+  def test_set_live_control_writes_integral_values_as_ints(self):
+    calls = []
+    def run(*args): calls.append(args)
+    control = {"param": "VAD Threshold (%)", "integer": True}
+    wavemix_fx.set_live_control(run, 34, "fx0", control, 60)
+    self.assertIn('"fx0:VAD Threshold (%)" 60', calls[0][4])
+
+  def chain_state(self):
+    return {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"vadThreshold": 60, "dryMix": 25}},
+      {"id": "highpass-1", "plugin": "highpass", "enabled": False,
+       "controls": {"freq": 120}}]}}
+
+  def test_apply_chain_controls_skips_missing_node_and_disabled(self):
+    calls = []
+    def run(*args): calls.append(args)
+    self.assertEqual(
+      wavemix_fx.apply_chain_controls(run, None, self.chain_state(), self.manifests),
+      0)
+    self.assertEqual(calls, [])
+
+  @patch.object(wavemix_fx, "set_live_control")
+  def test_apply_chain_controls_applies_stored_values_and_skips_bypassed(
+      self, set_control):
+    self.assertEqual(
+      wavemix_fx.apply_chain_controls(
+        lambda *args: "", 34, self.chain_state(), self.manifests),
+      2)
+    self.assertEqual(
+      [(call.args[2], call.args[3]["param"], call.args[4])
+       for call in set_control.call_args_list],
+      [("fx0", "VAD Threshold (%)", 60), ("fx0", "Dry Mix", 0.25)])
+
+  @patch.object(wavemix_fx, "set_live_control")
+  def test_apply_chain_controls_ignores_unknown_stored_keys(self, set_control):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"gone": 10}}]}}
+    self.assertEqual(
+      wavemix_fx.apply_chain_controls(
+        lambda *args: "", 34, state, self.manifests), 0)
+    set_control.assert_not_called()
+
+  def test_first_instance_of_returns_first_matching_chain_entry(self):
+    state = {"micFx": {"chain": [
+      {"id": "highpass-1", "plugin": "highpass"},
+      {"id": "rnnoise-1", "plugin": "rnnoise"},
+      {"id": "rnnoise-2", "plugin": "rnnoise"}]}}
+    self.assertEqual(wavemix_fx.first_instance_of(state, "rnnoise")["id"],
+                     "rnnoise-1")
+    self.assertIsNone(wavemix_fx.first_instance_of(state, "noisegate"))
 
 
-class ControlTests(unittest.TestCase):
-  def test_control_keys_are_unique_and_ranges_make_sense(self):
-    keys = [spec["key"] for spec in wavemix.MICFX_CONTROLS]
-    params = [spec["param"] for spec in wavemix.MICFX_CONTROLS]
+class MicfxCommandTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls._user_dir = tempfile.TemporaryDirectory()
+    cls.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
 
-    self.assertEqual(len(keys), len(set(keys)))
-    self.assertEqual(len(params), len(set(params)))
-    self.assertEqual(set(keys), {"vadThreshold", "vadGrace", "retroactiveGrace", "dryMix"})
-    for spec in wavemix.MICFX_CONTROLS:
-      self.assertLessEqual(spec["min"], spec["max"])
-      self.assertGreater(spec["step"], 0)
-      self.assertGreater(spec["scale"], 0)
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
 
-  def test_dry_mix_scales_between_percent_and_raw_fraction(self):
-    spec = control("dryMix")
+  def state(self):
+    return {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"vadThreshold": 55, "vadGrace": 200,
+                    "retroactiveGrace": 0, "dryMix": 10}}]}}
 
-    self.assertEqual(wavemix.micfx_raw_value(spec, 50), 0.5)
-    self.assertEqual(wavemix.micfx_raw_value(spec, 100), 1.0)
-    self.assertEqual(wavemix.micfx_display_value(spec, 0.25), 25)
-    self.assertEqual(wavemix.micfx_display_value(spec, 1.0), 100)
+  def args(self, *argv):
+    return wavemix.build_parser().parse_args(["micfx", *argv])
 
-  def test_integer_controls_keep_their_display_value(self):
-    spec = control("vadThreshold")
+  def test_controls_reads_live_values_for_the_first_rnnoise(self):
+    output = io.StringIO()
+    with patch.object(wavemix, "load_state", return_value=self.state()), \
+         patch.object(wavemix, "mic_fx_available", return_value=True), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix, "sh", return_value=SAMPLE_PARAMS), \
+         contextlib.redirect_stdout(output):
+      wavemix.cmd_micfx(self.args("controls", "--json"))
 
-    self.assertEqual(wavemix.micfx_raw_value(spec, 60), 60)
-    self.assertEqual(wavemix.micfx_display_value(spec, 60), 60)
+    out = json.loads(output.getvalue())
+    self.assertEqual(set(out), {"enabled", "available", "running", "controls"})
+    self.assertTrue(out["running"])
+    values = {item["key"]: item["value"] for item in out["controls"]}
+    self.assertEqual(values["vadThreshold"], 50)
+    self.assertEqual(values["dryMix"], 25)
+    self.assertEqual(values["vadGrace"], 200)
 
+  def test_controls_falls_back_to_stored_values_when_node_is_missing(self):
+    output = io.StringIO()
+    with patch.object(wavemix, "load_state", return_value=self.state()), \
+         patch.object(wavemix, "mic_fx_available", return_value=True), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         patch.object(wavemix, "sh") as sh, \
+         contextlib.redirect_stdout(output):
+      wavemix.cmd_micfx(self.args("controls", "--json"))
 
-class SnapshotTests(unittest.TestCase):
-  @patch.object(wavemix, "sh", return_value=PW_CLI_PROPS)
-  @patch.object(wavemix, "micfx_node_id", return_value=34)
-  def test_reads_live_values_and_metadata(self, _node, _sh):
-    snapshot = wavemix.micfx_controls_snapshot()
-    by_key = {item["key"]: item for item in snapshot["controls"]}
+    out = json.loads(output.getvalue())
+    self.assertFalse(out["running"])
+    values = {item["key"]: item["value"] for item in out["controls"]}
+    self.assertEqual(values["vadThreshold"], 55)
+    self.assertEqual(values["dryMix"], 10)
+    sh.assert_not_called()
 
-    self.assertTrue(snapshot["running"])
-    self.assertEqual(by_key["vadThreshold"]["value"], 50)
-    self.assertEqual(by_key["vadThreshold"]["max"], 99)
-    self.assertEqual(by_key["vadGrace"]["value"], 200)
-    self.assertEqual(by_key["retroactiveGrace"]["value"], 0)
-    self.assertEqual(by_key["dryMix"]["value"], 0)
-    self.assertEqual(by_key["dryMix"]["unit"], "%")
+  def test_set_stores_renders_and_applies_to_the_first_rnnoise(self):
+    state = self.state()
+    output = io.StringIO()
+    with patch.object(wavemix, "load_state", return_value=state), \
+         patch.object(wavemix, "save_state") as save, \
+         patch.object(wavemix, "graph_lock", contextlib.nullcontext), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix.fx, "render_to_disk") as render, \
+         patch.object(wavemix, "sh") as sh, \
+         contextlib.redirect_stdout(output):
+      wavemix.cmd_micfx(self.args("set", "dryMix", "25"))
 
-  @patch.object(wavemix, "micfx_node_id", return_value=None)
-  def test_falls_back_to_defaults_when_node_is_missing(self, _node):
-    snapshot = wavemix.micfx_controls_snapshot()
-    by_key = {item["key"]: item for item in snapshot["controls"]}
-
-    self.assertFalse(snapshot["running"])
-    self.assertEqual(by_key["vadThreshold"]["value"], 50)
-    self.assertEqual(by_key["vadGrace"]["value"], 200)
-    self.assertEqual(by_key["retroactiveGrace"]["value"], 0)
-    self.assertEqual(by_key["dryMix"]["value"], 0)
-
-
-class SetControlTests(unittest.TestCase):
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=34)
-  def test_stores_display_value_and_sends_raw_value(self, _node, sh):
-    state = {"micFx": {"enabled": True}}
-
-    result = wavemix.set_micfx_control(state, "dryMix", 25)
-
-    self.assertEqual(state["micFx"]["controls"]["dryMix"], 25)
-    self.assertTrue(result["applied"])
+    self.assertEqual(state["micFx"]["chain"][0]["controls"]["dryMix"], 25)
+    save.assert_called_once_with(state)
+    render.assert_called_once()
     self.assertEqual(sh.call_args.args[:4], ("pw-cli", "set-param", "34", "Props"))
-    self.assertIn('"rnnoise:Dry Mix" 0.250000', sh.call_args.args[4])
+    self.assertIn('"fx0:Dry Mix" 0.250000', sh.call_args.args[4])
+    self.assertIn("Dry mix = 25%", output.getvalue())
 
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=34)
-  def test_clamps_values_to_the_control_range(self, _node, sh):
-    state = {"micFx": {"enabled": True}}
+  def test_set_maps_to_the_first_rnnoise_node_not_the_first_chain_node(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "highpass-1", "plugin": "highpass", "enabled": True,
+       "controls": {"freq": 80}},
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"dryMix": 10}}]}}
+    with patch.object(wavemix, "load_state", return_value=state), \
+         patch.object(wavemix, "save_state"), \
+         patch.object(wavemix, "graph_lock", contextlib.nullcontext), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix.fx, "render_to_disk"), \
+         patch.object(wavemix, "sh") as sh, \
+         contextlib.redirect_stdout(io.StringIO()):
+      wavemix.cmd_micfx(self.args("set", "dryMix", "25"))
 
-    wavemix.set_micfx_control(state, "vadThreshold", 500)
-    self.assertEqual(state["micFx"]["controls"]["vadThreshold"], 99)
+    self.assertIn('"fx1:Dry Mix" 0.250000', sh.call_args.args[4])
 
-    wavemix.set_micfx_control(state, "vadThreshold", -10)
-    self.assertEqual(state["micFx"]["controls"]["vadThreshold"], 0)
+  def test_set_stores_without_applying_when_the_node_is_missing(self):
+    state = self.state()
+    output = io.StringIO()
+    with patch.object(wavemix, "load_state", return_value=state), \
+         patch.object(wavemix, "save_state"), \
+         patch.object(wavemix, "graph_lock", contextlib.nullcontext), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         patch.object(wavemix.fx, "render_to_disk"), \
+         patch.object(wavemix, "sh") as sh, \
+         contextlib.redirect_stdout(output):
+      wavemix.cmd_micfx(self.args("set", "vadGrace", "500"))
 
-    self.assertIn('"rnnoise:VAD Threshold (%)" 99', sh.call_args_list[0].args[4])
-    self.assertIn('"rnnoise:VAD Threshold (%)" 0', sh.call_args_list[1].args[4])
-
-  def test_rejects_unknown_control_without_touching_state(self):
-    state = {"micFx": {"enabled": True}}
-
-    result = wavemix.set_micfx_control(state, "nope", 1)
-
-    self.assertIsNone(result)
-    self.assertNotIn("controls", state["micFx"])
-
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=None)
-  def test_still_stores_when_the_node_is_not_running(self, _node, sh):
-    state = {"micFx": {"enabled": True}}
-
-    result = wavemix.set_micfx_control(state, "vadGrace", 500)
-
-    self.assertEqual(state["micFx"]["controls"]["vadGrace"], 500)
-    self.assertFalse(result["applied"])
+    self.assertEqual(state["micFx"]["chain"][0]["controls"]["vadGrace"], 500)
     sh.assert_not_called()
-
-
-class ApplyOverridesTests(unittest.TestCase):
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=34)
-  def test_applies_only_stored_overrides(self, _node, sh):
-    state = {"micFx": {"controls": {"vadGrace": 300, "dryMix": 25}}}
-
-    wavemix.apply_micfx_overrides(state)
-
-    self.assertEqual(sh.call_count, 2)
-    payloads = [call.args[4] for call in sh.call_args_list]
-    self.assertTrue(any('"rnnoise:VAD Grace Period (ms)" 300' in p for p in payloads))
-    self.assertTrue(any('"rnnoise:Dry Mix" 0.250000' in p for p in payloads))
-
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=None)
-  def test_does_nothing_when_the_node_is_missing(self, _node, sh):
-    state = {"micFx": {"controls": {"vadGrace": 300}}}
-
-    wavemix.apply_micfx_overrides(state)
-
-    sh.assert_not_called()
-
-  @patch.object(wavemix, "sh")
-  @patch.object(wavemix, "micfx_node_id", return_value=34)
-  def test_ignores_unknown_stored_keys(self, _node, sh):
-    state = {"micFx": {"controls": {"gone": 10}}}
-
-    wavemix.apply_micfx_overrides(state)
-
-    sh.assert_not_called()
+    self.assertIn("stored", output.getvalue())
 
 
 if __name__ == "__main__":

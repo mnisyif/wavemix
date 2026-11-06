@@ -44,23 +44,6 @@ MICFX_SOURCE = "wavemix_micfx"       # the mic effect chain's internal node
 MICFX_CAPTURE = "wavemix_micfx.capture"  # its capture (input) node
 MICFX_CONF = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) \
     / "pipewire" / "pipewire.conf.d" / "90-wavemix-micfx.conf"
-# Live RNNoise controls exposed by the filter-chain node. `scale` converts
-# between the raw LADSPA value and the value shown in the UI (Dry Mix is 0..1
-# at the plugin but 0..100% in the panel).
-MICFX_CONTROLS = (
-  {"key": "vadThreshold", "param": "VAD Threshold (%)", "label": "VAD threshold",
-   "min": 0, "max": 99, "step": 1, "unit": "%", "scale": 1, "default": 50,
-   "integer": True},
-  {"key": "vadGrace", "param": "VAD Grace Period (ms)", "label": "VAD grace",
-   "min": 0, "max": 1000, "step": 10, "unit": " ms", "scale": 1, "default": 200,
-   "integer": True},
-  {"key": "retroactiveGrace", "param": "Retroactive VAD Grace (ms)",
-   "label": "Retroactive grace", "min": 0, "max": 200, "step": 5, "unit": " ms",
-   "scale": 1, "default": 0, "integer": True},
-  {"key": "dryMix", "param": "Dry Mix", "label": "Dry mix",
-   "min": 0, "max": 100, "step": 1, "unit": "%", "scale": 100, "default": 0,
-   "integer": True, "raw_float": True},
-)
 MICBUS_TAG = "micbus"                # loopback tag for mic -> mic bus
 TAG_KEY = "wavemix"
 NULL_PREFIX = "wavemix_"
@@ -314,122 +297,6 @@ def mic_fx_available() -> bool:
   return MICFX_CONF.is_file()
 
 
-def parse_micfx_params(text: str) -> dict[str, float | int]:
-  """Read the `rnnoise:*` control values from `pw-cli enum-params` output."""
-  values: dict[str, float | int] = {}
-  lines = str(text or "").splitlines()
-  for i, line in enumerate(lines):
-    match = re.search(r'String "rnnoise:([^"]+)"', line)
-    if not match:
-      continue
-    key = match.group(1)
-    for value_line in lines[i + 1:i + 4]:
-      value = re.match(r"\s*(Int|Float)\s+([-+0-9.eE]+)", value_line)
-      if not value:
-        continue
-      number = float(value.group(2))
-      values[key] = int(number) if value.group(1) == "Int" else number
-      break
-  return values
-
-
-def micfx_node_id() -> int | None:
-  """The PipeWire object id of the filter-chain's capture node."""
-  try:
-    nodes = json.loads(sh("pw-dump") or "[]")
-  except json.JSONDecodeError:
-    return None
-  for node in nodes:
-    props = (node.get("info") or {}).get("props") or {}
-    if props.get("node.name") != MICFX_CAPTURE:
-      continue
-    try:
-      return int(node.get("id"))
-    except (TypeError, ValueError):
-      return None
-  return None
-
-
-def micfx_raw_value(spec: dict, display: float) -> float:
-  return float(display) / float(spec["scale"])
-
-
-def micfx_display_value(spec: dict, raw: float):
-  value = float(raw) * float(spec["scale"])
-  return int(round(value)) if spec["integer"] else round(value, 2)
-
-
-def micfx_clamped(spec: dict, value) -> float | int:
-  try:
-    number = float(value)
-  except (TypeError, ValueError):
-    number = spec["default"]
-  number = max(spec["min"], min(spec["max"], number))
-  return int(round(number)) if spec["integer"] else round(number, 2)
-
-
-def _set_micfx_param(node: int, spec: dict, raw: float) -> None:
-  value = f"{raw:.6f}" if spec.get("raw_float") else str(int(round(raw)))
-  payload = '{ params = ["rnnoise:%s" %s] }' % (spec["param"], value)
-  sh("pw-cli", "set-param", str(node), "Props", payload)
-
-
-def apply_micfx_control(spec: dict, raw: float) -> bool:
-  node = micfx_node_id()
-  if node is None:
-    return False
-  _set_micfx_param(node, spec, raw)
-  return True
-
-
-def apply_micfx_overrides(state: dict) -> None:
-  """Push saved control values onto a live filter-chain node, if present."""
-  overrides = (state.get("micFx") or {}).get("controls") or {}
-  if not overrides:
-    return
-  node = micfx_node_id()
-  if node is None:
-    return
-  for spec in MICFX_CONTROLS:
-    if spec["key"] not in overrides:
-      continue
-    value = micfx_clamped(spec, overrides[spec["key"]])
-    _set_micfx_param(node, spec, micfx_raw_value(spec, value))
-
-
-def micfx_controls_snapshot() -> dict:
-  """Live RNNoise controls plus the metadata the panel needs to render them."""
-  node = micfx_node_id()
-  live = parse_micfx_params(sh("pw-cli", "enum-params", str(node), "Props")) \
-      if node is not None else {}
-  controls = []
-  for spec in MICFX_CONTROLS:
-    value = (micfx_display_value(spec, live[spec["param"]])
-             if spec["param"] in live else spec["default"])
-    controls.append({
-      "key": spec["key"],
-      "label": spec["label"],
-      "value": value,
-      "min": spec["min"],
-      "max": spec["max"],
-      "step": spec["step"],
-      "unit": spec["unit"],
-    })
-  return {"running": node is not None, "controls": controls}
-
-
-def set_micfx_control(state: dict, key: str, value) -> dict | None:
-  """Store one control override and apply it live when the node exists."""
-  spec = next((item for item in MICFX_CONTROLS if item["key"] == key), None)
-  if spec is None:
-    return None
-  display = micfx_clamped(spec, value)
-  state.setdefault("micFx", {}).setdefault("controls", {})[key] = display
-  applied = apply_micfx_control(spec, micfx_raw_value(spec, display))
-  return {"key": key, "label": spec["label"], "value": display,
-          "unit": spec["unit"], "applied": applied}
-
-
 def mic_source(state: dict) -> str:
   """Where the buses pull the mic from. With FX on, the filter-chain feeds the
   mic bus, so the buses take its monitor; otherwise the raw hardware mic."""
@@ -634,7 +501,9 @@ def up(state: dict) -> None:
   else:
     set_mic_fx_link(raw_mic, False)
     ensure_mic_bus_feed(mic)
-  apply_micfx_overrides(state)
+  fx.apply_chain_controls(
+    sh, fx.find_capture_node_id(sh), state,
+    fx.discover_manifests(fx.bundled_dir(), fx.user_dir(), fx.WAVEMIX_VERSION))
   for channel in state["channels"]:
     ensure_channel_sink(channel)
     for send in ("output", "input"):
@@ -932,11 +801,59 @@ def cmd_mute(args) -> None:
   print(json.dumps({which: device_mute(which, state)}))
 
 
+def _fx_manifests() -> dict[str, dict]:
+  return fx.discover_manifests(
+    fx.bundled_dir(), fx.user_dir(), fx.WAVEMIX_VERSION)
+
+
+def _display_control_value(control: dict, raw) -> float | int:
+  value = float(raw) * float(control.get("scale", 1))
+  return int(round(value)) if control.get("integer") else round(value, 2)
+
+
+def _micfx_controls_snapshot(state: dict, manifests: dict[str, dict]) -> dict:
+  """Live values for the first RNNoise instance, plus panel metadata."""
+  instance = fx.first_instance_of(state, "rnnoise")
+  manifest = manifests.get("rnnoise")
+  if not isinstance(manifest, dict):
+    manifest = {}
+  node = (fx.node_for_instance(state, manifests, instance["id"])
+          if isinstance(instance, dict) else None)
+  node_id = fx.find_capture_node_id(sh)
+  live = fx.live_control_values(sh, node_id) \
+      if node_id is not None and node is not None else {}
+  stored = instance.get("controls") if isinstance(instance, dict) else {}
+  if not isinstance(stored, dict):
+    stored = {}
+
+  controls = []
+  for control in manifest.get("controls", []):
+    key = control.get("key")
+    param = f"{node}:{control.get('param')}" if node else ""
+    if param in live:
+      value = _display_control_value(control, live[param])
+    elif key in stored:
+      value = stored[key]
+    else:
+      value = control.get("default")
+    controls.append({
+      "key": key,
+      "label": control.get("label"),
+      "value": value,
+      "min": control.get("min"),
+      "max": control.get("max"),
+      "step": control.get("step"),
+      "unit": control.get("unit"),
+    })
+  return {"running": node_id is not None, "controls": controls}
+
+
 def cmd_micfx(args) -> None:
   state = load_state()
   if args.action == "controls":
+    manifests = _fx_manifests()
     out = {"enabled": mic_fx_enabled(state), "available": mic_fx_available()}
-    out.update(micfx_controls_snapshot())
+    out.update(_micfx_controls_snapshot(state, manifests))
     if args.json:
       print(json.dumps(out, indent=2))
       return
@@ -951,27 +868,46 @@ def cmd_micfx(args) -> None:
     if len(args.args) != 2:
       sys.exit("wavemix: micfx set needs <control> <value>")
     key, value = args.args
+    manifests = _fx_manifests()
+    instance = fx.first_instance_of(state, "rnnoise")
+    if instance is None:
+      sys.exit("wavemix: no RNNoise effect in the chain")
     with graph_lock():
-      result = set_micfx_control(state, key, value)
+      result = fx.set_instance_control(
+        state, manifests, instance["id"], key, value)
       if result is None:
         sys.exit(f"wavemix: no such mic fx control: {key}")
       save_state(state)
-    note = "" if result["applied"] else "  (stored; RNNoise node not running)"
-    print(f"wavemix: mic fx {result['label']} = "
-          f"{result['value']}{result['unit']}{note}")
+    fx.render_to_disk(state, manifests, fx.WAVEMIX_VERSION)
+
+    plugin_manifest = manifests.get(instance.get("plugin")) or {}
+    control = next(
+      (item for item in plugin_manifest.get("controls", [])
+       if item.get("key") == key), None)
+    node = fx.node_for_instance(state, manifests, instance["id"])
+    node_id = fx.find_capture_node_id(sh)
+    applied = False
+    if control is not None and node is not None and node_id is not None:
+      raw = float(result["value"]) / float(control.get("scale", 1) or 1)
+      fx.set_live_control(sh, node_id, node, control, raw)
+      applied = True
+    label = control.get("label", key) if control else key
+    unit = control.get("unit", "") if control else ""
+    note = "" if applied else "  (stored; RNNoise node not running)"
+    print(f"wavemix: mic fx {label} = {result['value']}{unit}{note}")
     return
-  fx = state.setdefault("micFx", {"enabled": False})
+  micfx = state.setdefault("micFx", {"enabled": False})
   if args.action == "on":
-    fx["enabled"] = True
+    micfx["enabled"] = True
   elif args.action == "off":
-    fx["enabled"] = False
+    micfx["enabled"] = False
   else:
-    fx["enabled"] = not fx.get("enabled", False)
+    micfx["enabled"] = not micfx.get("enabled", False)
   with graph_lock():
     save_state(state)
     up(state)
   note = "" if mic_fx_available() else "  (filter-chain fragment missing - see pipewire.conf.d/90-wavemix-micfx.conf)"
-  print(f"wavemix: mic fx {'on' if fx['enabled'] else 'off'}{note}")
+  print(f"wavemix: mic fx {'on' if micfx['enabled'] else 'off'}{note}")
 
 
 def cmd_apps(args) -> None:
