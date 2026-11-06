@@ -9,6 +9,7 @@ from pathlib import Path
 
 WAVEMIX_VERSION = "1.1.0"
 MANIFEST_SCHEMA_VERSION = 1
+STATE_VERSION = 2
 
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -44,6 +45,20 @@ def version_at_least(current: str, minimum: str) -> bool:
 
 
 # ------------------------------------------------------------------- manifests
+
+def bundled_dir() -> Path:
+  """Where the installer puts the bundled plugin manifests."""
+  base = os.environ.get("XDG_DATA_HOME")
+  root = Path(base) if base else Path.home() / ".local" / "share"
+  return root / "wavemix" / "plugins"
+
+
+def user_dir() -> Path:
+  """Where users drop their own plugin manifests."""
+  base = os.environ.get("XDG_CONFIG_HOME")
+  root = Path(base) if base else Path.home() / ".config"
+  return root / "wavemix" / "plugins"
+
 
 def _synthetic_id(path: Path) -> str:
   stem = re.sub(r"[^a-z0-9_-]+", "_", Path(path).stem.lower()).strip("_-")
@@ -368,3 +383,282 @@ def plugin_list(manifests: dict[str, dict]) -> list[dict]:
   rows = [{field: manifest.get(field) for field in _PLUGIN_LIST_FIELDS}
           for manifest in manifests.values()]
   return sorted(rows, key=lambda row: (row["id"], row["source"]))
+
+
+# ----------------------------------------------------------------------- state
+
+def _micfx(state: dict) -> dict:
+  micfx = state.get("micFx")
+  if not isinstance(micfx, dict):
+    micfx = {}
+    state["micFx"] = micfx
+  return micfx
+
+
+def _read_chain(state: dict) -> list | None:
+  if not isinstance(state, dict):
+    return None
+  micfx = state.get("micFx")
+  if not isinstance(micfx, dict):
+    return None
+  chain = micfx.get("chain")
+  return chain if isinstance(chain, list) else None
+
+
+def _writable_chain(state: dict) -> list:
+  chain = _micfx(state).get("chain")
+  if not isinstance(chain, list):
+    chain = []
+    _micfx(state)["chain"] = chain
+  return chain
+
+
+def _new_instance(plugin_id: str, instance_id: str, manifest: dict) -> dict:
+  return {
+    "id": instance_id,
+    "plugin": manifest.get("id") or plugin_id,
+    "pluginVersion": manifest.get("version", ""),
+    "enabled": True,
+    "controls": manifest_defaults(manifest),
+  }
+
+
+def default_chain(manifests: dict[str, dict]) -> list[dict]:
+  """One enabled instance for each usable manifest marked as a default."""
+  chain = []
+  for plugin_id in sorted(manifests):
+    manifest = manifests[plugin_id]
+    if not isinstance(manifest, dict):
+      continue
+    if not manifest.get("default"):
+      continue
+    if not manifest.get("available") or manifest.get("error"):
+      continue
+    chain.append(_new_instance(plugin_id, f"{plugin_id}-1", manifest))
+  return chain
+
+
+def _migrate_outputs(state: dict) -> None:
+  devices = state.get("devices")
+  if not isinstance(devices, dict):
+    devices = {}
+    state["devices"] = devices
+
+  outputs = devices.get("outputs")
+  if not isinstance(outputs, list):
+    outputs = []
+  outputs = [name for name in outputs if isinstance(name, str) and name]
+  if not outputs:
+    primary = devices.get("output")
+    if not isinstance(primary, str) or not primary:
+      primary = "@DEFAULT_SINK@"
+    outputs = [primary]
+
+  devices["outputs"] = outputs
+  primary = devices.get("output")
+  if not isinstance(primary, str) or primary not in outputs:
+    devices["output"] = outputs[0]
+
+
+def migrate_state(state: dict, manifests: dict[str, dict], version: str) -> dict:
+  """Bring a loaded state up to STATE_VERSION without losing unknown fields."""
+  if not isinstance(state, dict):
+    state = {}
+
+  raw_version = state.get("version", 1)
+  if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+    raw_version = 1
+  if raw_version > STATE_VERSION:
+    raise FxError(
+      f"state version {raw_version} is newer than supported version "
+      f"{STATE_VERSION}; update Wavemix")
+
+  micfx = _micfx(state)
+  if raw_version < STATE_VERSION:
+    controls = micfx.get("controls")
+    if isinstance(controls, dict) and controls:
+      rnnoise = manifests.get("rnnoise")
+      rnnoise = rnnoise if isinstance(rnnoise, dict) else {}
+      valid_keys = {
+        control.get("key") for control in rnnoise.get("controls", [])
+        if isinstance(control, dict)
+      }
+      migrated = {key: value for key, value in controls.items()
+                  if key in valid_keys}
+      for key, value in manifest_defaults(rnnoise).items():
+        migrated.setdefault(key, value)
+      micfx["chain"] = [{
+        "id": "rnnoise-1",
+        "plugin": "rnnoise",
+        "pluginVersion": rnnoise.get("version", ""),
+        "enabled": True,
+        "controls": migrated,
+      }]
+    else:
+      micfx["chain"] = default_chain(manifests)
+    micfx.pop("controls", None)
+  elif not isinstance(micfx.get("chain"), list):
+    micfx["chain"] = default_chain(manifests)
+
+  micfx.setdefault("enabled", False)
+  state["version"] = STATE_VERSION
+  _migrate_outputs(state)
+  return state
+
+
+def find_instance(state: dict, instance_id: str) -> dict | None:
+  chain = _read_chain(state)
+  if chain is None:
+    return None
+  for instance in chain:
+    if isinstance(instance, dict) and instance.get("id") == instance_id:
+      return instance
+  return None
+
+
+def add_instance(state: dict, manifests: dict[str, dict], plugin_id: str,
+                 index: int | None = None) -> dict:
+  """Add one instance, returning it, or raise FxError for an unusable plugin."""
+  manifest = manifests.get(plugin_id)
+  if not isinstance(manifest, dict):
+    raise FxError(f"unknown plugin '{plugin_id}'")
+  if not manifest.get("available") or manifest.get("error"):
+    reason = manifest.get("error") or manifest.get("requires") \
+        or "plugin is unavailable"
+    raise FxError(f"cannot add plugin '{plugin_id}': {reason}")
+
+  chain = _writable_chain(state)
+  if not manifest.get("allowMultiple", True) \
+      and any(isinstance(instance, dict)
+              and instance.get("plugin") == plugin_id for instance in chain):
+    raise FxError(f"plugin '{plugin_id}' does not allow multiple instances")
+
+  used: set[int] = set()
+  prefix = f"{plugin_id}-"
+  for instance in chain:
+    ident = instance.get("id") if isinstance(instance, dict) else None
+    if not isinstance(ident, str) or not ident.startswith(prefix):
+      continue
+    suffix = ident[len(prefix):]
+    if suffix.isdigit() and int(suffix) > 0:
+      used.add(int(suffix))
+
+  number = 1
+  while number in used:
+    number += 1
+  instance = _new_instance(plugin_id, f"{plugin_id}-{number}", manifest)
+
+  if index is None:
+    chain.append(instance)
+  else:
+    try:
+      position = int(index)
+    except (TypeError, ValueError):
+      position = len(chain)
+    chain.insert(max(0, min(position, len(chain))), instance)
+  return instance
+
+
+def remove_instance(state: dict, instance_id: str) -> bool:
+  chain = _read_chain(state)
+  if chain is None:
+    return False
+  for position, instance in enumerate(chain):
+    if isinstance(instance, dict) and instance.get("id") == instance_id:
+      del chain[position]
+      return True
+  return False
+
+
+def move_instance(state: dict, instance_id: str, direction: str) -> bool:
+  chain = _read_chain(state)
+  if chain is None:
+    return False
+  for position, instance in enumerate(chain):
+    if not isinstance(instance, dict) or instance.get("id") != instance_id:
+      continue
+    if direction == "up" and position > 0:
+      chain[position - 1], chain[position] = chain[position], chain[position - 1]
+      return True
+    if direction == "down" and position < len(chain) - 1:
+      chain[position + 1], chain[position] = chain[position], chain[position + 1]
+      return True
+    return False
+  return False
+
+
+def toggle_instance(state: dict, instance_id: str) -> bool:
+  instance = find_instance(state, instance_id)
+  if instance is None:
+    return False
+  instance["enabled"] = not bool(instance.get("enabled", True))
+  return True
+
+
+def _clamp_display(spec: dict, value) -> float | int:
+  try:
+    number = float(value)
+  except (TypeError, ValueError):
+    number = float(spec.get("default", 0))
+  minimum = float(spec.get("min", number))
+  maximum = float(spec.get("max", number))
+  number = max(minimum, min(maximum, number))
+  return int(round(number)) if spec.get("integer") else round(number, 2)
+
+
+def set_instance_control(state: dict, manifests: dict[str, dict],
+                         instance_id: str, key: str, value) -> dict | None:
+  instance = find_instance(state, instance_id)
+  if instance is None:
+    return None
+  manifest = manifests.get(instance.get("plugin"))
+  if not isinstance(manifest, dict):
+    return None
+  spec = next((control for control in manifest.get("controls", [])
+               if isinstance(control, dict) and control.get("key") == key), None)
+  if spec is None:
+    return None
+
+  display = _clamp_display(spec, value)
+  controls = instance.get("controls")
+  if not isinstance(controls, dict):
+    controls = {}
+    instance["controls"] = controls
+  controls[key] = display
+  return {"instance": instance_id, "control": key, "value": display}
+
+
+def enabled_instances(state: dict, manifests: dict[str, dict]) -> list[dict]:
+  """Enabled, available instances in processing order with their fx node."""
+  micfx = state.get("micFx") if isinstance(state, dict) else None
+  if not isinstance(micfx, dict) or not micfx.get("enabled"):
+    return []
+  chain = micfx.get("chain")
+  if not isinstance(chain, list):
+    return []
+
+  entries = []
+  for instance in chain:
+    if not isinstance(instance, dict):
+      continue
+    if not instance.get("enabled", True):
+      continue
+    manifest = manifests.get(instance.get("plugin"))
+    if not isinstance(manifest, dict):
+      continue
+    if not manifest.get("available") or manifest.get("error"):
+      continue
+    entries.append({
+      "instance": instance,
+      "manifest": manifest,
+      "node": f"fx{len(entries)}",
+    })
+  return entries
+
+
+def node_for_instance(state: dict, manifests: dict[str, dict],
+                      instance_id: str) -> str | None:
+  for entry in enabled_instances(state, manifests):
+    if entry["instance"].get("id") == instance_id:
+      return entry["node"]
+  return None

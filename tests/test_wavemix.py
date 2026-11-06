@@ -243,6 +243,80 @@ class ManifestTests(unittest.TestCase):
       "source", "available", "gpu", "requires", "error"})
 
 
+class StateTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    global manifests
+    cls._user_dir = tempfile.TemporaryDirectory()
+    manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
+
+  def test_v1_controls_migrate_to_rnnoise_instance(self):
+    state = {"version": 1, "micFx": {"enabled": True,
+             "controls": {"vadThreshold": 35, "dryMix": 50}}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual(migrated["version"], 2)
+    self.assertEqual(migrated["micFx"]["chain"][0]["id"], "rnnoise-1")
+    self.assertEqual(migrated["micFx"]["chain"][0]["pluginVersion"], manifests["rnnoise"]["version"])
+    self.assertEqual(migrated["micFx"]["chain"][0]["controls"]["vadThreshold"], 35)
+    self.assertEqual(migrated["micFx"]["chain"][0]["controls"]["dryMix"], 50)
+
+  def test_v1_without_controls_uses_default_chain(self):
+    state = {"version": 1, "micFx": {"enabled": False}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual([i["plugin"] for i in migrated["micFx"]["chain"]], ["rnnoise"])
+
+  def test_newer_state_version_is_rejected(self):
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.migrate_state({"version": 3}, manifests, "1.1.0")
+
+  def test_missing_outputs_migrates_to_primary(self):
+    state = {"version": 1, "devices": {"output": "alsa_out", "input": "alsa_in"},
+             "micFx": {"enabled": False}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual(migrated["devices"]["outputs"], ["alsa_out"])
+
+  def test_existing_outputs_are_preserved(self):
+    state = {"version": 2, "devices": {"output": "a", "outputs": ["a", "b"],
+             "input": "in"}, "micFx": {"enabled": False, "chain": []}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual(migrated["devices"]["outputs"], ["a", "b"])
+    self.assertEqual(migrated["devices"]["output"], "a")
+
+  def test_add_remove_move_toggle_and_instance_ids(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": []}}
+    first = wavemix_fx.add_instance(state, manifests, "highpass")
+    second = wavemix_fx.add_instance(state, manifests, "highpass")
+    self.assertEqual(first["id"], "highpass-1")
+    self.assertEqual(second["id"], "highpass-2")
+    self.assertTrue(wavemix_fx.move_instance(state, "highpass-2", "up"))
+    self.assertEqual(state["micFx"]["chain"][0]["id"], "highpass-2")
+    self.assertTrue(wavemix_fx.toggle_instance(state, "highpass-2"))
+    self.assertFalse(state["micFx"]["chain"][0]["enabled"])
+    self.assertTrue(wavemix_fx.remove_instance(state, "highpass-2"))
+
+  def test_set_control_clamps_and_rejects_unknown(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "pluginVersion": "1.0.0",
+       "enabled": True, "controls": {}}]}}
+    high = wavemix_fx.set_instance_control(state, manifests, "rnnoise-1", "vadThreshold", 500)
+    self.assertEqual(high["value"], 99)
+    self.assertIsNone(wavemix_fx.set_instance_control(state, manifests, "rnnoise-1", "nope", 1))
+
+  def test_enabled_instances_assigns_fx_nodes_in_order(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True, "controls": {}},
+      {"id": "highpass-1", "plugin": "highpass", "enabled": False, "controls": {}},
+      {"id": "noisegate-1", "plugin": "noisegate", "enabled": True, "controls": {}}]}}
+    nodes = [item["node"] for item in wavemix_fx.enabled_instances(state, manifests)]
+    self.assertEqual(nodes, ["fx0", "fx1"])
+    self.assertIsNone(wavemix_fx.node_for_instance(state, manifests, "highpass-1"))
+
+
 PW_CLI_PROPS = """
 Object: size 288, type Spa:Pod:Object:Param:Props (262146), id Spa:Enum:ParamId:Props (2)
   Prop: key Spa:Pod:Object:Param:Props:params (524289), flags 00000000
