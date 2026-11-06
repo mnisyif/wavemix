@@ -1073,6 +1073,198 @@ class UpReapplyTests(unittest.TestCase):
     self.assertEqual(events[1][0], "link")
 
 
+class MultiOutputGraphTests(unittest.TestCase):
+  def hardware(self, *names):
+    return [{"name": name, "properties": {"device.api": "alsa"}} for name in names]
+
+  def stream(self, index, tag, sink):
+    return {"index": index, "sink": sink,
+            "volume": {"front-left": {"value_percent": "70%"}},
+            "mute": False, "properties": {wavemix.TAG_KEY: tag}}
+
+  def test_channel_targets_returns_each_selected_output(self):
+    devices = {"output": "a", "outputs": ["a", "b", "c"]}
+    self.assertEqual(wavemix.channel_targets({"source": "apps"}, "output", devices),
+                     ["a", "b", "c"])
+    self.assertEqual(wavemix.channel_targets({"source": "apps"}, "input", devices),
+                     [wavemix.STREAM_BUS])
+
+  def test_channel_targets_dedupes_and_falls_back(self):
+    self.assertEqual(wavemix.channel_targets({}, "output", {"outputs": ["a", "a"]}), ["a"])
+    self.assertEqual(wavemix.channel_targets({}, "output", {"output": "a"}), ["a"])
+    self.assertEqual(wavemix.channel_targets({}, "output", {}), ["@DEFAULT_SINK@"])
+
+  def test_ensure_send_creates_one_loopback_per_output(self):
+    channel = {"id": "browser", "name": "Browser", "source": "apps"}
+    devices = {"output": "a", "outputs": ["a", "b"], "input": "mic"}
+    existing = [self.stream(3, "browser:output", 10)]
+    with patch.object(wavemix, "sink_inputs", return_value=existing), \
+         patch.object(wavemix, "sink_name_by_index", return_value={"10": "a"}), \
+         patch.object(wavemix, "load_module") as load:
+      wavemix.ensure_send(channel, "output", devices, "mic")
+
+    load.assert_called_once()
+    args = load.call_args.args
+    self.assertEqual(args[0], "module-loopback")
+    self.assertIn("sink=b", args)
+    self.assertIn("sink_input_muted=1", args)
+    self.assertIn(f"sink_input_properties={wavemix.TAG_KEY}=browser:output", args)
+    self.assertIn("source=wavemix_browser.monitor", args)
+
+  def test_graph_up_requires_a_stream_for_every_output_target(self):
+    state = {
+      "devices": {"output": "a", "outputs": ["a", "b"], "input": "mic"},
+      "channels": [{
+        "id": "browser", "name": "Browser", "source": "apps",
+        "output": {"on": True, "volume": 70},
+        "input": {"on": False, "volume": 50},
+      }],
+      "micFx": {"enabled": False},
+    }
+    inputs = [self.stream(1, wavemix.MICBUS_TAG, 99),
+              self.stream(3, "browser:output", 10),
+              self.stream(7, "browser:output", 11),
+              self.stream(9, "browser:input", 20)]
+    sinks = [{"index": 10, "name": "a"}, {"index": 11, "name": "b"},
+             {"index": 20, "name": wavemix.STREAM_BUS}]
+    with patch.object(wavemix, "existing_source_names",
+                      return_value={wavemix.MIC_BUS_SOURCE,
+                                    wavemix.STREAM_BUS_SOURCE}), \
+         patch.object(wavemix, "existing_sink_names",
+                      return_value={"wavemix_browser"}), \
+         patch.object(wavemix, "sinks", return_value=sinks), \
+         patch.object(wavemix, "sink_inputs", return_value=inputs):
+      self.assertTrue(wavemix.graph_up(state))
+
+    with patch.object(wavemix, "existing_source_names",
+                      return_value={wavemix.MIC_BUS_SOURCE,
+                                    wavemix.STREAM_BUS_SOURCE}), \
+         patch.object(wavemix, "existing_sink_names",
+                      return_value={"wavemix_browser"}), \
+         patch.object(wavemix, "sinks", return_value=sinks), \
+         patch.object(wavemix, "sink_inputs",
+                      return_value=[si for si in inputs if si["sink"] != 11]):
+      self.assertFalse(wavemix.graph_up(state))
+
+  def test_apply_all_sends_updates_every_copy(self):
+    state = {"channels": [{
+      "id": "browser", "source": "apps",
+      "output": {"on": True, "volume": 70},
+      "input": {"on": False, "volume": 50},
+    }]}
+    streams = [self.stream(3, "browser:output", 10),
+               self.stream(7, "browser:output", 11)]
+    calls = []
+
+    def fake_sh(*args):
+      calls.append(args)
+      return ""
+
+    with patch.object(wavemix, "sink_inputs", return_value=streams), \
+         patch.object(wavemix, "sh", side_effect=fake_sh):
+      wavemix.apply_all_sends(state)
+
+    volumes = [call for call in calls if call[1] == "set-sink-input-volume"]
+    mutes = [call for call in calls if call[1] == "set-sink-input-mute"]
+    self.assertEqual({call[2] for call in volumes}, {"3", "7"})
+    self.assertEqual({call[3] for call in volumes}, {"70%"})
+    self.assertEqual({call[2] for call in mutes}, {"3", "7"})
+    self.assertEqual({call[3] for call in mutes}, {"0"})
+
+  def test_status_reports_output_targets_and_all_target_liveness(self):
+    state = {
+      "devices": {"output": "a", "outputs": ["a", "b"], "input": "mic"},
+      "channels": [{
+        "id": "browser", "name": "Browser", "source": "apps",
+        "output": {"on": True, "volume": 70},
+        "input": {"on": False, "volume": 50},
+      }],
+      "micFx": {"enabled": False},
+    }
+    streams = [self.stream(3, "browser:output", 10),
+               self.stream(7, "browser:output", 11)]
+    output = io.StringIO()
+    with patch.object(wavemix, "sink_inputs", return_value=streams), \
+         patch.object(wavemix, "sink_name_by_index",
+                      return_value={"10": "a", "11": "b"}), \
+         patch.object(wavemix, "sinks", return_value=self.hardware("a", "b")), \
+         patch.object(wavemix, "sources", return_value=[]), \
+         patch.object(wavemix, "existing_source_names", return_value=set()), \
+         patch.object(wavemix, "sh", return_value="a"), \
+         contextlib.redirect_stdout(output):
+      wavemix.status(state, True)
+
+    send = json.loads(output.getvalue())["graph"]["channels"]["browser"]["sends"]["output"]
+    self.assertEqual(send["targets"], ["a", "b"])
+    self.assertEqual(send["liveTargets"], ["a", "b"])
+    self.assertTrue(send["live"])
+    self.assertEqual(send["liveVolume"], 70)
+    self.assertFalse(send["liveMuted"])
+
+  def test_status_is_not_live_until_every_target_has_a_stream(self):
+    state = {
+      "devices": {"output": "a", "outputs": ["a", "b"], "input": "mic"},
+      "channels": [{
+        "id": "browser", "name": "Browser", "source": "apps",
+        "output": {"on": True, "volume": 70},
+        "input": {"on": False, "volume": 50},
+      }],
+      "micFx": {"enabled": False},
+    }
+    output = io.StringIO()
+    with patch.object(wavemix, "sink_inputs",
+                      return_value=[self.stream(3, "browser:output", 10)]), \
+         patch.object(wavemix, "sink_name_by_index", return_value={"10": "a"}), \
+         patch.object(wavemix, "sinks", return_value=self.hardware("a", "b")), \
+         patch.object(wavemix, "sources", return_value=[]), \
+         patch.object(wavemix, "existing_source_names", return_value=set()), \
+         patch.object(wavemix, "sh", return_value="a"), \
+         contextlib.redirect_stdout(output):
+      wavemix.status(state, True)
+
+    send = json.loads(output.getvalue())["graph"]["channels"]["browser"]["sends"]["output"]
+    self.assertEqual(send["liveTargets"], ["a"])
+    self.assertFalse(send["live"])
+
+  def test_sanitize_devices_keeps_at_least_one_output(self):
+    state = {
+      "devices": {"output": "wavemix_browser",
+                  "outputs": ["wavemix_browser", "speakers"], "input": "mic"},
+    }
+    with patch.object(wavemix, "sinks", return_value=self.hardware("speakers")), \
+         patch.object(wavemix, "sources", return_value=self.hardware("mic")), \
+         patch.object(wavemix, "default_name", return_value="speakers"):
+      changed = wavemix.sanitize_devices(state)
+
+    self.assertTrue(changed)
+    self.assertEqual(state["devices"]["outputs"], ["speakers"])
+    self.assertEqual(state["devices"]["output"], "speakers")
+
+  def test_sanitize_devices_falls_back_to_the_default_sink(self):
+    state = {
+      "devices": {"output": "wavemix_browser",
+                  "outputs": ["wavemix_browser"], "input": "mic"},
+    }
+    with patch.object(wavemix, "sinks", return_value=self.hardware("speakers")), \
+         patch.object(wavemix, "sources", return_value=self.hardware("mic")), \
+         patch.object(wavemix, "default_name", return_value="speakers"):
+      changed = wavemix.sanitize_devices(state)
+
+    self.assertTrue(changed)
+    self.assertEqual(state["devices"]["outputs"], ["speakers"])
+    self.assertEqual(state["devices"]["output"], "speakers")
+
+  def test_device_mute_is_true_only_when_all_outputs_are_muted(self):
+    state = {"devices": {"output": "a", "outputs": ["a", "b"], "input": "mic"}}
+    devices = [{"name": "a", "mute": True}, {"name": "b", "mute": False}]
+    with patch.object(wavemix, "sinks", return_value=devices):
+      self.assertFalse(wavemix.device_mute("output", state))
+
+    devices[1]["mute"] = True
+    with patch.object(wavemix, "sinks", return_value=devices):
+      self.assertTrue(wavemix.device_mute("output", state))
+
+
 class InstallerTests(unittest.TestCase):
   def test_installer_ships_effect_module_and_manifests(self):
     text = (ROOT / "install.sh").read_text()

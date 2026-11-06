@@ -178,12 +178,15 @@ def existing_source_names() -> set[str]:
   return {str(s.get("name") or "") for s in sources()}
 
 
-def stream_for(channel_id: str, send: str) -> dict | None:
+def streams_for(channel_id: str, send: str) -> list[dict]:
+  """Every loopback carrying this channel send (one per selected output)."""
   want = f"{channel_id}:{send}"
-  for si in sink_inputs():
-    if str((si.get("properties") or {}).get(TAG_KEY) or "") == want:
-      return si
-  return None
+  return [si for si in sink_inputs()
+          if str((si.get("properties") or {}).get(TAG_KEY) or "") == want]
+
+
+def stream_for(channel_id: str, send: str) -> dict | None:
+  return next(iter(streams_for(channel_id, send)), None)
 
 
 def volume_percent(si: dict) -> int:
@@ -280,13 +283,36 @@ def find_channel(state: dict, ident: str) -> dict | None:
   return None
 
 
-def channel_target(channel: dict, send: str, devices: dict) -> str | None:
-  if send == "output":
-    return devices.get("output") or "@DEFAULT_SINK@"
+def channel_targets(channel: dict, send: str, devices: dict) -> list[str]:
+  """The sink targets one channel send fans out to.
+
+  Output goes to every selected hardware output (deduped); input stays a single
+  loopback to the Stream bus."""
   if send == "input":
-    # A channel's "in" send feeds the Stream bus (mic + whatever you include).
-    return STREAM_BUS
-  return None
+    return [STREAM_BUS]
+  if send != "output":
+    return []
+  raw = devices.get("outputs")
+  names = raw if isinstance(raw, list) else []
+  targets: list[str] = []
+  for item in names:
+    name = str(item).strip() if isinstance(item, str) else ""
+    if name and name not in targets:
+      targets.append(name)
+  if targets:
+    return targets
+  primary = devices.get("output")
+  if isinstance(primary, str) and primary.strip():
+    return [primary.strip()]
+  return ["@DEFAULT_SINK@"]
+
+
+def target_has_stream(target: str, live: set[str | None]) -> bool:
+  """Whether a tagged stream already lands on this target.
+
+  PipeWire resolves the @DEFAULT_SINK@ sentinel itself, so any live copy
+  satisfies it (the stream's sink index always maps to a concrete name)."""
+  return target in live or (target == "@DEFAULT_SINK@" and any(live))
 
 
 def mic_fx_enabled(state: dict) -> bool:
@@ -413,58 +439,96 @@ def ensure_channel_sink(channel: dict) -> None:
 
 
 def ensure_send(channel: dict, send: str, devices: dict, mic: str) -> None:
-  if stream_for(channel["id"], send) is not None:
-    return
   capture = channel_capture(channel, devices, mic)
-  target = channel_target(channel, send, devices)
-  if not capture or not target:
+  targets = channel_targets(channel, send, devices)
+  if not capture or not targets:
     return
-  # Create muted: apply_all_sends() levels every send right after the graph is
-  # built, and until then a fresh loopback must not blurt its source into the
-  # output (that transient is what leaks the mic into the headphones).
-  load_module("module-loopback", f"source={capture}", f"sink={target}",
-              f"latency_msec={SEND_LATENCY_MS}",
-              "sink_input_muted=1",
-              f"sink_input_properties={TAG_KEY}={channel['id']}:{send}")
+  by_index = sink_name_by_index()
+  live = {by_index.get(str(si.get("sink")))
+          for si in streams_for(channel["id"], send)}
+  for target in targets:
+    if target_has_stream(target, live):
+      continue
+    # Create muted: apply_all_sends() levels every send right after the graph is
+    # built, and until then a fresh loopback must not blurt its source into the
+    # output (that transient is what leaks the mic into the headphones).
+    load_module("module-loopback", f"source={capture}", f"sink={target}",
+                f"latency_msec={SEND_LATENCY_MS}",
+                "sink_input_muted=1",
+                f"sink_input_properties={TAG_KEY}={channel['id']}:{send}")
+    # A sentinel target cannot match a sink name; never add it twice in a run.
+    live.add(target)
 
 
 def apply_all_sends(state: dict) -> None:
-  """Push every send's level and mute onto its live loopback.
+  """Push every send's level and mute onto its live loopback(s).
 
   One `pactl list` covers the whole graph. Toggling or leveling one send moves
   the bus trim, which changes every other send's live gain too, so all of them
-  are rewritten together."""
-  streams: dict[str, dict] = {}
+  are rewritten together. An output send may have one loopback per selected
+  hardware output; the shared tag keeps them at one fader/mute."""
+  streams: dict[str, list[dict]] = {}
   for si in sink_inputs():
     tag = str((si.get("properties") or {}).get(TAG_KEY) or "")
     if tag:
-      streams[tag] = si
+      streams.setdefault(tag, []).append(si)
   trims = {send: bus_trim(state, send) for send in ("output", "input")}
   for channel in state["channels"]:
     for send in ("output", "input"):
-      si = streams.get(f"{channel['id']}:{send}")
-      if si is None:
+      copies = streams.get(f"{channel['id']}:{send}") or []
+      if not copies:
         continue
       cfg = channel.get(send) or {}
-      index = str(si["index"])
-      sh("pactl", "set-sink-input-volume", index,
-         f"{trimmed_percent(int(cfg.get('volume', 100)), trims[send])}%")
-      sh("pactl", "set-sink-input-mute", index, "0" if cfg.get("on", True) else "1")
+      volume = f"{trimmed_percent(int(cfg.get('volume', 100)), trims[send])}%"
+      mute = "0" if cfg.get("on", True) else "1"
+      for si in copies:
+        index = str(si["index"])
+        sh("pactl", "set-sink-input-volume", index, volume)
+        sh("pactl", "set-sink-input-mute", index, mute)
 
 
 def sanitize_devices(state: dict) -> bool:
-  """Keep the engine's output/input on real hardware (never a bus or a sentinel)."""
+  """Keep the engine's outputs/input on real hardware (never a bus or a sentinel).
+
+  Every selected output must be a live hardware device, but at least one must
+  remain: drop vanished/virtual entries and fall back to the default sink (or
+  the first hardware sink) when the list empties. `devices.output` always
+  mirrors the first selected output."""
   changed = False
-  for which in ("output", "input"):
-    names = {d["name"] for d in hardware_devices(which)}
-    cur = str(state["devices"].get(which) or "")
-    if cur in names:
-      continue
-    pick = default_name(which)
+  devices = state.setdefault("devices", {})
+
+  hardware = [device["name"] for device in hardware_devices("output")]
+  names = set(hardware)
+  raw = devices.get("outputs")
+  current = [str(item) for item in raw] if isinstance(raw, list) else []
+  if not current:
+    primary = str(devices.get("output") or "")
+    if primary:
+      current = [primary]
+  kept: list[str] = []
+  for name in current:
+    if name in names and name not in kept:
+      kept.append(name)
+  if not kept:
+    pick = default_name("output")
     if pick not in names:
-      pick = next(iter(names)) if names else ("@DEFAULT_SINK@" if which == "output" else "@DEFAULT_SOURCE@")
+      pick = hardware[0] if hardware else "@DEFAULT_SINK@"
+    kept = [pick]
+  if devices.get("outputs") != kept:
+    devices["outputs"] = kept
+    changed = True
+  if devices.get("output") != kept[0]:
+    devices["output"] = kept[0]
+    changed = True
+
+  input_names = {device["name"] for device in hardware_devices("input")}
+  cur = str(devices.get("input") or "")
+  if cur not in input_names:
+    pick = default_name("input")
+    if pick not in input_names:
+      pick = next(iter(input_names)) if input_names else "@DEFAULT_SOURCE@"
     if cur != pick:
-      state["devices"][which] = pick
+      devices["input"] = pick
       changed = True
   return changed
 
@@ -543,21 +607,31 @@ def graph_up(state: dict) -> bool:
   sources = existing_source_names()
   if MIC_BUS_SOURCE not in sources or STREAM_BUS_SOURCE not in sources:
     return False
+  inputs = sink_inputs()
   # With mic FX on, the filter chain feeds the mic bus directly and the raw
   # mic->micbus loopback is deliberately absent. Requiring that loopback in
   # that mode makes graph_up() always false, so the watcher tears down and
   # rebuilds the whole graph on every tick (audio dropouts/clipping).
   if not mic_fx_enabled(state) and not any(
-      (si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG for si in sink_inputs()):
+      (si.get("properties") or {}).get(TAG_KEY) == MICBUS_TAG for si in inputs):
     return False
   name = existing_sink_names()
+  by_index = {str(s.get("index")): str(s.get("name") or "") for s in sinks()}
+  tagged: dict[str, list[dict]] = {}
+  for si in inputs:
+    tag = str((si.get("properties") or {}).get(TAG_KEY) or "")
+    if tag:
+      tagged.setdefault(tag, []).append(si)
   for channel in state["channels"]:
     if channel.get("source") == "mic":
       continue
     if sink_name(channel["id"]) not in name:
       return False
     for send in ("output", "input"):
-      if stream_for(channel["id"], send) is None:
+      live = {by_index.get(str(si.get("sink")))
+              for si in tagged.get(f"{channel['id']}:{send}", [])}
+      targets = channel_targets(channel, send, state["devices"])
+      if any(not target_has_stream(target, live) for target in targets):
         return False
   return True
 
@@ -587,18 +661,26 @@ def reconcile(state: dict) -> None:
 def status(state: dict, as_json: bool) -> None:
   sources = existing_source_names()
   trims = {send: bus_trim(state, send) for send in ("output", "input")}
+  by_index = sink_name_by_index()
   live = {"buses": {"mic": MIC_BUS_SOURCE in sources, "stream": STREAM_BUS_SOURCE in sources},
           "channels": {}}
   for channel in state["channels"]:
     entry = {"name": channel.get("name"), "source": channel.get("source"), "sends": {}}
     for send in ("output", "input"):
-      si = stream_for(channel["id"], send)
+      copies = streams_for(channel["id"], send)
+      si = copies[0] if copies else None
+      targets = channel_targets(channel, send, state["devices"])
+      stream_targets = [by_index.get(str(item.get("sink"))) for item in copies]
+      live_targets = [target for target in targets
+                      if target_has_stream(target, set(stream_targets))]
       cfg = channel.get(send) or {}
       entry["sends"][send] = {
         "on": bool(cfg.get("on", True)),
         "volume": int(cfg.get("volume", 100)),
         "trim": round(trims[send], 4),
-        "live": si is not None,
+        "targets": targets,
+        "liveTargets": live_targets,
+        "live": bool(targets) and len(live_targets) == len(targets),
         "liveVolume": volume_percent(si) if si else None,
         "liveMuted": bool(si.get("mute")) if si else None,
       }
@@ -717,13 +799,21 @@ def cmd_channel(args) -> None:
 
 
 def device_mute(which: str, state: dict) -> bool:
-  """Mute state of the selected physical output/input device."""
-  name = str(state["devices"].get(which, ""))
+  """Mute state of the selected physical device(s).
+
+  The output is muted only when every selected output is muted; a mixed set
+  reads as unmuted."""
+  devices = state.get("devices") or {}
+  if which == "output":
+    names = channel_targets({}, "output", devices)
+  else:
+    names = [str(devices.get("input") or "")]
   items = sinks() if which == "output" else sources()
-  for device in items:
-    if str(device.get("name")) == name:
-      return bool(device.get("mute"))
-  return False
+  by_name = {str(device.get("name")): device for device in items}
+  selected = [by_name[name] for name in names if name in by_name]
+  if not selected:
+    return False
+  return all(bool(device.get("mute")) for device in selected)
 
 
 def cmd_device(args) -> None:
