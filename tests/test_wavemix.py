@@ -246,10 +246,13 @@ class ManifestTests(unittest.TestCase):
 class StateTests(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
-    global manifests
     cls._user_dir = tempfile.TemporaryDirectory()
-    manifests = wavemix_fx.discover_manifests(
+    cls.manifests = wavemix_fx.discover_manifests(
       ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    # Keep the suite hermetic: pretend the RNNoise LADSPA is installed even
+    # when this host does not have it.
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
 
   @classmethod
   def tearDownClass(cls):
@@ -258,39 +261,54 @@ class StateTests(unittest.TestCase):
   def test_v1_controls_migrate_to_rnnoise_instance(self):
     state = {"version": 1, "micFx": {"enabled": True,
              "controls": {"vadThreshold": 35, "dryMix": 50}}}
-    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    migrated = wavemix_fx.migrate_state(state, self.manifests, "1.1.0")
     self.assertEqual(migrated["version"], 2)
     self.assertEqual(migrated["micFx"]["chain"][0]["id"], "rnnoise-1")
-    self.assertEqual(migrated["micFx"]["chain"][0]["pluginVersion"], manifests["rnnoise"]["version"])
+    self.assertEqual(migrated["micFx"]["chain"][0]["pluginVersion"], self.manifests["rnnoise"]["version"])
     self.assertEqual(migrated["micFx"]["chain"][0]["controls"]["vadThreshold"], 35)
     self.assertEqual(migrated["micFx"]["chain"][0]["controls"]["dryMix"], 50)
 
+  def test_v1_controls_are_retained_when_rnnoise_manifest_is_missing(self):
+    controls = {"vadThreshold": 35, "dryMix": 50}
+    state = {"version": 1, "micFx": {"enabled": True, "controls": controls}}
+    migrated = wavemix_fx.migrate_state(state, {}, "1.1.0")
+    self.assertEqual(migrated["version"], 2)
+    self.assertEqual(migrated["micFx"]["controls"], controls)
+    self.assertEqual(
+      migrated["micFx"]["chain"][0]["controls"], controls)
+
   def test_v1_without_controls_uses_default_chain(self):
     state = {"version": 1, "micFx": {"enabled": False}}
-    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    migrated = wavemix_fx.migrate_state(state, self.manifests, "1.1.0")
     self.assertEqual([i["plugin"] for i in migrated["micFx"]["chain"]], ["rnnoise"])
 
   def test_newer_state_version_is_rejected(self):
     with self.assertRaises(wavemix_fx.FxError):
-      wavemix_fx.migrate_state({"version": 3}, manifests, "1.1.0")
+      wavemix_fx.migrate_state({"version": 3}, self.manifests, "1.1.0")
+
+  def test_newer_state_version_as_string_or_float_is_rejected(self):
+    for version in ("3", 3.0):
+      with self.subTest(version=version):
+        with self.assertRaises(wavemix_fx.FxError):
+          wavemix_fx.migrate_state({"version": version}, self.manifests, "1.1.0")
 
   def test_missing_outputs_migrates_to_primary(self):
     state = {"version": 1, "devices": {"output": "alsa_out", "input": "alsa_in"},
              "micFx": {"enabled": False}}
-    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    migrated = wavemix_fx.migrate_state(state, self.manifests, "1.1.0")
     self.assertEqual(migrated["devices"]["outputs"], ["alsa_out"])
 
   def test_existing_outputs_are_preserved(self):
     state = {"version": 2, "devices": {"output": "a", "outputs": ["a", "b"],
              "input": "in"}, "micFx": {"enabled": False, "chain": []}}
-    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    migrated = wavemix_fx.migrate_state(state, self.manifests, "1.1.0")
     self.assertEqual(migrated["devices"]["outputs"], ["a", "b"])
     self.assertEqual(migrated["devices"]["output"], "a")
 
   def test_add_remove_move_toggle_and_instance_ids(self):
     state = {"version": 2, "micFx": {"enabled": True, "chain": []}}
-    first = wavemix_fx.add_instance(state, manifests, "highpass")
-    second = wavemix_fx.add_instance(state, manifests, "highpass")
+    first = wavemix_fx.add_instance(state, self.manifests, "highpass")
+    second = wavemix_fx.add_instance(state, self.manifests, "highpass")
     self.assertEqual(first["id"], "highpass-1")
     self.assertEqual(second["id"], "highpass-2")
     self.assertTrue(wavemix_fx.move_instance(state, "highpass-2", "up"))
@@ -303,18 +321,32 @@ class StateTests(unittest.TestCase):
     state = {"version": 2, "micFx": {"enabled": True, "chain": [
       {"id": "rnnoise-1", "plugin": "rnnoise", "pluginVersion": "1.0.0",
        "enabled": True, "controls": {}}]}}
-    high = wavemix_fx.set_instance_control(state, manifests, "rnnoise-1", "vadThreshold", 500)
+    high = wavemix_fx.set_instance_control(
+      state, self.manifests, "rnnoise-1", "vadThreshold", 500)
     self.assertEqual(high["value"], 99)
-    self.assertIsNone(wavemix_fx.set_instance_control(state, manifests, "rnnoise-1", "nope", 1))
+    self.assertIsNone(wavemix_fx.set_instance_control(
+      state, self.manifests, "rnnoise-1", "nope", 1))
+
+  def test_set_control_preserves_sub_hundredth_steps(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "noisegate-1", "plugin": "noisegate",
+       "enabled": True, "controls": {}}]}}
+    for value in (0.001, 0.005):
+      with self.subTest(value=value):
+        result = wavemix_fx.set_instance_control(
+          state, self.manifests, "noisegate-1", "attack", value)
+        self.assertEqual(result["value"], value)
 
   def test_enabled_instances_assigns_fx_nodes_in_order(self):
     state = {"version": 2, "micFx": {"enabled": True, "chain": [
       {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True, "controls": {}},
       {"id": "highpass-1", "plugin": "highpass", "enabled": False, "controls": {}},
       {"id": "noisegate-1", "plugin": "noisegate", "enabled": True, "controls": {}}]}}
-    nodes = [item["node"] for item in wavemix_fx.enabled_instances(state, manifests)]
+    nodes = [item["node"] for item in wavemix_fx.enabled_instances(
+      state, self.manifests)]
     self.assertEqual(nodes, ["fx0", "fx1"])
-    self.assertIsNone(wavemix_fx.node_for_instance(state, manifests, "highpass-1"))
+    self.assertIsNone(wavemix_fx.node_for_instance(
+      state, self.manifests, "highpass-1"))
 
 
 PW_CLI_PROPS = """

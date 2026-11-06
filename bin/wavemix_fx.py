@@ -460,14 +460,29 @@ def _migrate_outputs(state: dict) -> None:
     devices["output"] = outputs[0]
 
 
+def _state_version(value) -> int:
+  """Coerce a state version, rejecting ambiguous or non-numeric values."""
+  if isinstance(value, bool):
+    raise FxError(f"invalid state version {value!r}")
+  if isinstance(value, int):
+    return value
+  if isinstance(value, (float, str)):
+    try:
+      number = float(value)
+    except (TypeError, ValueError):
+      raise FxError(f"invalid state version {value!r}") from None
+    if not math.isfinite(number) or not number.is_integer():
+      raise FxError(f"invalid state version {value!r}")
+    return int(number)
+  raise FxError(f"invalid state version {value!r}")
+
+
 def migrate_state(state: dict, manifests: dict[str, dict], version: str) -> dict:
   """Bring a loaded state up to STATE_VERSION without losing unknown fields."""
   if not isinstance(state, dict):
     state = {}
 
-  raw_version = state.get("version", 1)
-  if isinstance(raw_version, bool) or not isinstance(raw_version, int):
-    raw_version = 1
+  raw_version = _state_version(state.get("version", 1))
   if raw_version > STATE_VERSION:
     raise FxError(
       f"state version {raw_version} is newer than supported version "
@@ -478,25 +493,31 @@ def migrate_state(state: dict, manifests: dict[str, dict], version: str) -> dict
     controls = micfx.get("controls")
     if isinstance(controls, dict) and controls:
       rnnoise = manifests.get("rnnoise")
-      rnnoise = rnnoise if isinstance(rnnoise, dict) else {}
-      valid_keys = {
-        control.get("key") for control in rnnoise.get("controls", [])
-        if isinstance(control, dict)
-      }
-      migrated = {key: value for key, value in controls.items()
-                  if key in valid_keys}
-      for key, value in manifest_defaults(rnnoise).items():
-        migrated.setdefault(key, value)
+      if isinstance(rnnoise, dict):
+        valid_keys = {
+          control.get("key") for control in rnnoise.get("controls", [])
+          if isinstance(control, dict)
+        }
+        migrated = {key: value for key, value in controls.items()
+                    if key in valid_keys}
+        for key, value in manifest_defaults(rnnoise).items():
+          migrated.setdefault(key, value)
+        plugin_version = rnnoise.get("version", "")
+        micfx.pop("controls", None)
+      else:
+        # Manifest metadata is unavailable: keep every old value (and the
+        # legacy controls map) so a later save cannot lose them.
+        migrated = dict(controls)
+        plugin_version = ""
       micfx["chain"] = [{
         "id": "rnnoise-1",
         "plugin": "rnnoise",
-        "pluginVersion": rnnoise.get("version", ""),
+        "pluginVersion": plugin_version,
         "enabled": True,
         "controls": migrated,
       }]
     else:
       micfx["chain"] = default_chain(manifests)
-    micfx.pop("controls", None)
   elif not isinstance(micfx.get("chain"), list):
     micfx["chain"] = default_chain(manifests)
 
@@ -595,6 +616,20 @@ def toggle_instance(state: dict, instance_id: str) -> bool:
   return True
 
 
+def _decimal_places(number: float) -> int:
+  text = f"{float(number):.12f}".rstrip("0").rstrip(".")
+  return len(text.partition(".")[2])
+
+
+def _quantize_step(number: float, minimum: float, maximum: float,
+                   step: float) -> float:
+  if step <= 0:
+    return number
+  snapped = minimum + round((number - minimum) / step) * step
+  snapped = max(minimum, min(maximum, snapped))
+  return round(snapped, max(_decimal_places(minimum), _decimal_places(step)))
+
+
 def _clamp_display(spec: dict, value) -> float | int:
   try:
     number = float(value)
@@ -603,7 +638,10 @@ def _clamp_display(spec: dict, value) -> float | int:
   minimum = float(spec.get("min", number))
   maximum = float(spec.get("max", number))
   number = max(minimum, min(maximum, number))
-  return int(round(number)) if spec.get("integer") else round(number, 2)
+  if spec.get("integer"):
+    return int(round(number))
+  return _quantize_step(number, minimum, maximum,
+                        float(spec.get("step", 0) or 0))
 
 
 def set_instance_control(state: dict, manifests: dict[str, dict],
