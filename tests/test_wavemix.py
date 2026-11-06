@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 LOADER = importlib.machinery.SourceFileLoader("wavemix", str(ROOT / "bin" / "wavemix"))
@@ -537,9 +537,18 @@ class LiveControlTests(unittest.TestCase):
     calls = []
     def run(*args): calls.append(args)
     control = {"param": "Dry Mix", "integer": True, "raw_float": True, "scale": 100}
-    wavemix_fx.set_live_control(run, 34, "fx0", control, 0.25)
+    self.assertTrue(
+      wavemix_fx.set_live_control(run, 34, "fx0", control, 0.25))
     self.assertEqual(calls[0][:4], ("pw-cli", "set-param", "34", "Props"))
     self.assertIn('"fx0:Dry Mix" 0.250000', calls[0][4])
+
+  def test_set_live_control_reports_a_missing_node(self):
+    calls = []
+    def run(*args): calls.append(args)
+    control = {"param": "Dry Mix", "raw_float": True}
+    self.assertFalse(
+      wavemix_fx.set_live_control(run, None, "fx0", control, 0.25))
+    self.assertEqual(calls, [])
 
   def test_set_live_control_writes_integral_values_as_ints(self):
     calls = []
@@ -584,6 +593,20 @@ class LiveControlTests(unittest.TestCase):
       wavemix_fx.apply_chain_controls(
         lambda *args: "", 34, state, self.manifests), 0)
     set_control.assert_not_called()
+
+  def test_apply_chain_controls_clamps_out_of_range_stored_values(self):
+    calls = []
+    def run(*args): calls.append(args)
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"vadThreshold": 500, "dryMix": -50}}]}}
+    self.assertEqual(
+      wavemix_fx.apply_chain_controls(run, 34, state, self.manifests), 2)
+    payloads = [call[4] for call in calls]
+    self.assertTrue(any(
+      '"fx0:VAD Threshold (%)" 99' in payload for payload in payloads))
+    self.assertTrue(any(
+      '"fx0:Dry Mix" 0.000000' in payload for payload in payloads))
 
   def test_first_instance_of_returns_first_matching_chain_entry(self):
     state = {"micFx": {"chain": [
@@ -694,6 +717,54 @@ class MicfxCommandTests(unittest.TestCase):
 
     self.assertIn('"fx1:Dry Mix" 0.250000', sh.call_args.args[4])
 
+  def test_set_json_reports_applied_true_when_the_node_is_live(self):
+    state = self.state()
+    output = io.StringIO()
+    with patch.object(wavemix, "load_state", return_value=state), \
+         patch.object(wavemix, "save_state"), \
+         patch.object(wavemix, "graph_lock", contextlib.nullcontext), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix.fx, "render_to_disk"), \
+         patch.object(wavemix, "sh"), \
+         contextlib.redirect_stdout(output):
+      wavemix.cmd_micfx(self.args("set", "dryMix", "25", "--json"))
+
+    out = json.loads(output.getvalue())
+    self.assertTrue(out["applied"])
+    self.assertEqual(out["instance"], "rnnoise-1")
+    self.assertEqual(out["control"], "dryMix")
+    self.assertEqual(out["value"], 25)
+
+  def test_set_renders_while_holding_the_graph_lock(self):
+    state = self.state()
+    seen = []
+
+    @contextlib.contextmanager
+    def lock():
+      seen.append("lock")
+      try:
+        yield
+      finally:
+        seen.append("unlock")
+
+    def render(*args):
+      seen.append("render")
+
+    with patch.object(wavemix, "load_state", return_value=state), \
+         patch.object(wavemix, "save_state"), \
+         patch.object(wavemix, "graph_lock", lock), \
+         patch.object(wavemix.fx, "discover_manifests",
+                      return_value=self.manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         patch.object(wavemix.fx, "render_to_disk", side_effect=render), \
+         patch.object(wavemix, "sh"), \
+         contextlib.redirect_stdout(io.StringIO()):
+      wavemix.cmd_micfx(self.args("set", "dryMix", "25"))
+
+    self.assertEqual(seen[:3], ["lock", "render", "unlock"])
+
   def test_set_stores_without_applying_when_the_node_is_missing(self):
     state = self.state()
     output = io.StringIO()
@@ -706,11 +777,66 @@ class MicfxCommandTests(unittest.TestCase):
          patch.object(wavemix.fx, "render_to_disk"), \
          patch.object(wavemix, "sh") as sh, \
          contextlib.redirect_stdout(output):
-      wavemix.cmd_micfx(self.args("set", "vadGrace", "500"))
+      wavemix.cmd_micfx(self.args("set", "vadGrace", "500", "--json"))
 
     self.assertEqual(state["micFx"]["chain"][0]["controls"]["vadGrace"], 500)
     sh.assert_not_called()
-    self.assertIn("stored", output.getvalue())
+    out = json.loads(output.getvalue())
+    self.assertFalse(out["applied"])
+    self.assertEqual(out["control"], "vadGrace")
+    self.assertEqual(out["value"], 500)
+
+  def test_on_off_toggle_flip_the_master_switch_and_rebuild(self):
+    cases = (("on", False, True), ("off", True, False),
+             ("toggle", False, True), ("toggle", True, False))
+    for action, before, after in cases:
+      with self.subTest(action=action, before=before):
+        state = {"version": 2, "micFx": {"enabled": before, "chain": []}}
+        output = io.StringIO()
+        with patch.object(wavemix, "load_state", return_value=state), \
+             patch.object(wavemix, "save_state") as save, \
+             patch.object(wavemix, "graph_lock", contextlib.nullcontext), \
+             patch.object(wavemix, "up") as up, \
+             patch.object(wavemix, "mic_fx_available", return_value=True), \
+             contextlib.redirect_stdout(output):
+          wavemix.cmd_micfx(self.args(action))
+
+        self.assertEqual(state["micFx"]["enabled"], after)
+        save.assert_called_once_with(state)
+        up.assert_called_once_with(state)
+        self.assertIn("mic fx on" if after else "mic fx off",
+                      output.getvalue())
+
+
+class UpReapplyTests(unittest.TestCase):
+  def test_up_reapplies_stored_chain_controls(self):
+    state = {"version": 2,
+             "devices": {"output": "out", "outputs": ["out"],
+                         "input": "alsa_in"},
+             "channels": [], "defaults": {}, "rules": {},
+             "micFx": {"enabled": True, "chain": []}}
+    manifests = {}
+    with patch.multiple(
+        wavemix,
+        sanitize_devices=Mock(return_value=False),
+        unload_all=Mock(),
+        ensure_buses=Mock(),
+        ensure_defaults=Mock(),
+        set_mic_fx_link=Mock(),
+        set_mic_fx_playback_link=Mock(),
+        apply_all_sends=Mock()), \
+        patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+        patch.object(wavemix.fx, "discover_manifests",
+                     return_value=manifests), \
+        patch.object(wavemix.fx, "apply_chain_controls") as apply_controls:
+      wavemix.up(state)
+
+    apply_controls.assert_called_once()
+    args = apply_controls.call_args.args
+    self.assertIs(args[0], wavemix.sh)
+    self.assertEqual(args[1], 34)
+    self.assertIs(args[2], state)
+    self.assertIs(args[3], manifests)
 
 
 if __name__ == "__main__":

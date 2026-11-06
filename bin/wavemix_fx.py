@@ -776,11 +776,15 @@ def _live_raw_text(raw, control: dict) -> str:
   return str(int(round(number)))
 
 
-def set_live_control(run, node_id: int, node: str, control: dict, raw) -> None:
-  """Set one raw control value on the live filter-chain node."""
+def set_live_control(run, node_id: int | None, node: str, control: dict,
+                     raw) -> bool:
+  """Set one raw control value; False when the live node is missing."""
+  if node_id is None:
+    return False
   payload = '{ params = [%s %s] }' % (
     _spa_quote(f"{node}:{control['param']}"), _live_raw_text(raw, control))
   run("pw-cli", "set-param", str(node_id), "Props", payload)
+  return True
 
 
 def apply_chain_controls(run, node_id: int | None, state: dict,
@@ -799,9 +803,10 @@ def apply_chain_controls(run, node_id: int | None, state: dict,
       key = control.get("key")
       if key not in stored:
         continue
-      raw = _control_raw(stored[key], control)
-      set_live_control(run, node_id, entry["node"], control, raw)
-      applied += 1
+      value = _clamp_display(control, stored[key])
+      raw = _control_raw(value, control)
+      if set_live_control(run, node_id, entry["node"], control, raw):
+        applied += 1
   return applied
 
 

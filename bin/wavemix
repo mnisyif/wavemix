@@ -878,7 +878,7 @@ def cmd_micfx(args) -> None:
       if result is None:
         sys.exit(f"wavemix: no such mic fx control: {key}")
       save_state(state)
-    fx.render_to_disk(state, manifests, fx.WAVEMIX_VERSION)
+      fx.render_to_disk(state, manifests, fx.WAVEMIX_VERSION)
 
     plugin_manifest = manifests.get(instance.get("plugin")) or {}
     control = next(
@@ -887,10 +887,17 @@ def cmd_micfx(args) -> None:
     node = fx.node_for_instance(state, manifests, instance["id"])
     node_id = fx.find_capture_node_id(sh)
     applied = False
-    if control is not None and node is not None and node_id is not None:
+    if control is not None and node is not None:
       raw = float(result["value"]) / float(control.get("scale", 1) or 1)
-      fx.set_live_control(sh, node_id, node, control, raw)
-      applied = True
+      applied = fx.set_live_control(sh, node_id, node, control, raw)
+    if args.json:
+      print(json.dumps({
+        "instance": instance["id"],
+        "control": key,
+        "value": result["value"],
+        "applied": applied,
+      }))
+      return
     label = control.get("label", key) if control else key
     unit = control.get("unit", "") if control else ""
     note = "" if applied else "  (stored; RNNoise node not running)"
