@@ -492,6 +492,11 @@ def up(state: dict) -> None:
   unload_all()
   ensure_buses()
   ensure_defaults(state)
+  # Rewrite the generated chain on every rebuild so the live graph, the state
+  # file, and the plugin manifests can never drift apart.
+  manifests = fx.discover_manifests(
+    fx.bundled_dir(), fx.user_dir(), fx.WAVEMIX_VERSION)
+  fx.render_to_disk(state, manifests, fx.WAVEMIX_VERSION)
   mic = mic_source(state)
   raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
   if mic_fx_enabled(state):
@@ -502,8 +507,7 @@ def up(state: dict) -> None:
     set_mic_fx_link(raw_mic, False)
     ensure_mic_bus_feed(mic)
   fx.apply_chain_controls(
-    sh, fx.find_capture_node_id(sh), state,
-    fx.discover_manifests(fx.bundled_dir(), fx.user_dir(), fx.WAVEMIX_VERSION))
+    sh, fx.find_capture_node_id(sh), state, manifests)
   for channel in state["channels"]:
     ensure_channel_sink(channel)
     for send in ("output", "input"):

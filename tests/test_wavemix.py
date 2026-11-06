@@ -1025,6 +1025,7 @@ class UpReapplyTests(unittest.TestCase):
         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
         patch.object(wavemix.fx, "discover_manifests",
                      return_value=manifests), \
+        patch.object(wavemix.fx, "render_to_disk"), \
         patch.object(wavemix.fx, "apply_chain_controls") as apply_controls:
       wavemix.up(state)
 
@@ -1034,6 +1035,51 @@ class UpReapplyTests(unittest.TestCase):
     self.assertEqual(args[1], 34)
     self.assertIs(args[2], state)
     self.assertIs(args[3], manifests)
+
+  def test_up_renders_the_effect_config_before_linking(self):
+    state = {"version": 2,
+             "devices": {"output": "out", "outputs": ["out"],
+                         "input": "alsa_in"},
+             "channels": [], "defaults": {}, "rules": {},
+             "micFx": {"enabled": True, "chain": []}}
+    manifests = {}
+    events = []
+
+    def render(*args):
+      events.append(("render", args))
+
+    def link(*args):
+      events.append(("link", args))
+
+    with patch.multiple(
+        wavemix,
+        sanitize_devices=Mock(return_value=False),
+        unload_all=Mock(),
+        ensure_buses=Mock(),
+        ensure_defaults=Mock(),
+        set_mic_fx_link=Mock(side_effect=link),
+        set_mic_fx_playback_link=Mock(),
+        apply_all_sends=Mock()), \
+        patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+        patch.object(wavemix.fx, "discover_manifests",
+                     return_value=manifests), \
+        patch.object(wavemix.fx, "render_to_disk",
+                     side_effect=render), \
+        patch.object(wavemix.fx, "apply_chain_controls"):
+      wavemix.up(state)
+
+    self.assertEqual(events[0][0], "render")
+    self.assertEqual(events[0][1], (state, manifests, wavemix.fx.WAVEMIX_VERSION))
+    self.assertEqual(events[1][0], "link")
+
+
+class InstallerTests(unittest.TestCase):
+  def test_installer_ships_effect_module_and_manifests(self):
+    text = (ROOT / "install.sh").read_text()
+    self.assertIn("wavemix_fx.py", text)
+    self.assertIn("plugins", text)
+    self.assertIn("fx render", text)
+    self.assertIn("fx apply", text)
 
 
 if __name__ == "__main__":
