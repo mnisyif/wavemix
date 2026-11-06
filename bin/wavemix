@@ -283,6 +283,23 @@ def find_channel(state: dict, ident: str) -> dict | None:
   return None
 
 
+def output_selection(devices: dict) -> list[str]:
+  """The ordered, deduped output selection with primary/sentinel fallbacks."""
+  raw = devices.get("outputs")
+  names = raw if isinstance(raw, list) else []
+  selected: list[str] = []
+  for item in names:
+    name = str(item).strip() if isinstance(item, str) else ""
+    if name and name not in selected:
+      selected.append(name)
+  if selected:
+    return selected
+  primary = devices.get("output")
+  if isinstance(primary, str) and primary.strip():
+    return [primary.strip()]
+  return ["@DEFAULT_SINK@"]
+
+
 def channel_targets(channel: dict, send: str, devices: dict) -> list[str]:
   """The sink targets one channel send fans out to.
 
@@ -292,19 +309,7 @@ def channel_targets(channel: dict, send: str, devices: dict) -> list[str]:
     return [STREAM_BUS]
   if send != "output":
     return []
-  raw = devices.get("outputs")
-  names = raw if isinstance(raw, list) else []
-  targets: list[str] = []
-  for item in names:
-    name = str(item).strip() if isinstance(item, str) else ""
-    if name and name not in targets:
-      targets.append(name)
-  if targets:
-    return targets
-  primary = devices.get("output")
-  if isinstance(primary, str) and primary.strip():
-    return [primary.strip()]
-  return ["@DEFAULT_SINK@"]
+  return output_selection(devices)
 
 
 def target_has_stream(target: str, live: set[str | None]) -> bool:
@@ -818,13 +823,37 @@ def device_mute(which: str, state: dict) -> bool:
 
 def cmd_device(args) -> None:
   state = load_state()
-  if is_virtual(args.name):
-    sys.exit(f"wavemix: {args.name} is a wavemix bus, not a real device")
-  state["devices"][args.which] = args.name
+  devices = state.setdefault("devices", {})
+  action, name = args.action, args.name
+  if action != "output-remove" and is_virtual(name):
+    sys.exit(f"wavemix: {name} is a wavemix bus, not a real device")
+
+  if action == "input":
+    devices["input"] = name
+  else:
+    outputs = output_selection(devices)
+    if action == "output":
+      # Promote to the primary without dropping any other selection.
+      outputs = [name] + [item for item in outputs if item != name]
+    elif action == "output-add":
+      if name in outputs:
+        sys.exit(f"wavemix: {name} is already a selected output")
+      outputs.append(name)
+    elif action == "output-remove":
+      if name not in outputs:
+        sys.exit(f"wavemix: {name} is not a selected output")
+      if len(outputs) <= 1:
+        sys.exit("wavemix: cannot remove the last output")
+      outputs = [item for item in outputs if item != name]
+    else:
+      sys.exit(f"wavemix: unknown device action: {action}")
+    devices["outputs"] = outputs
+    devices["output"] = outputs[0]
+
   with graph_lock():
     save_state(state)
     up(state)
-  print(f"wavemix: {args.which} -> {args.name}")
+  print(f"wavemix: {action} -> {name}")
 
 
 def default_name(which: str) -> str:
@@ -851,6 +880,7 @@ def cmd_devices(args) -> None:
     "sources": mic_buses + hardware_inputs,
     "sinks": hardware_outputs,
     "selected": {"output": selected_device("output", state),
+                 "outputs": output_selection(state.get("devices") or {}),
                  "input": selected_device("input", state),
                  "defaultSource": default_name("input"),
                  "defaultSink": default_name("output")},
@@ -887,11 +917,23 @@ def cmd_mutes(args) -> None:
 def cmd_mute(args) -> None:
   state = load_state()
   which = args.which
-  name = str(state["devices"].get(which, ""))
-  if name == "":
+  if which == "output":
+    names = output_selection(state.get("devices") or {})
+    sub = "set-sink-mute"
+  else:
+    name = str((state.get("devices") or {}).get("input") or "")
+    names = [name] if name else []
+    sub = "set-source-mute"
+  if not names:
     sys.exit(f"wavemix: no {which} device selected")
-  sub = "set-sink-mute" if which == "output" else "set-source-mute"
-  sh("pactl", sub, name, {"on": "1", "off": "0", "toggle": "toggle"}[args.action])
+
+  action = args.action
+  if which == "output" and action == "toggle":
+    # All-muted toggles to unmuted; any live output mutes the whole set.
+    action = "off" if device_mute("output", state) else "on"
+  value = {"on": "1", "off": "0", "toggle": "toggle"}[action]
+  for name in names:
+    sh("pactl", sub, name, value)
   print(json.dumps({which: device_mute(which, state)}))
 
 
@@ -1383,8 +1425,8 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("--mic", action="store_true", help="the new channel is a microphone")
   p.set_defaults(func=cmd_channel)
 
-  p = sub.add_parser("device", help="choose the physical input/output")
-  p.add_argument("which", choices=["output", "input"])
+  p = sub.add_parser("device", help="choose or extend the physical input/output")
+  p.add_argument("action", choices=["output", "input", "output-add", "output-remove"])
   p.add_argument("name")
   p.set_defaults(func=cmd_device)
 

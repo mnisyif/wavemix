@@ -1265,6 +1265,184 @@ class MultiOutputGraphTests(unittest.TestCase):
       self.assertTrue(wavemix.device_mute("output", state))
 
 
+class MultiOutputCliTests(unittest.TestCase):
+  def setUp(self):
+    self.state = {
+      "version": 2,
+      "devices": {"output": "a", "outputs": ["a"], "input": "mic"},
+      "channels": [], "rules": {}, "defaults": {},
+      "micFx": {"enabled": False, "chain": []},
+    }
+    load = patch.object(wavemix, "load_state",
+                        side_effect=lambda: self.state)
+    lock = patch.object(wavemix, "graph_lock", contextlib.nullcontext)
+    for patcher in (load, lock):
+      patcher.start()
+      self.addCleanup(patcher.stop)
+    self.save_state = patch.object(wavemix, "save_state")
+    self.save_mock = self.save_state.start()
+    self.addCleanup(self.save_state.stop)
+    self.up = patch.object(wavemix, "up")
+    self.up_mock = self.up.start()
+    self.addCleanup(self.up.stop)
+
+  def run_cli(self, *argv):
+    with contextlib.redirect_stdout(io.StringIO()):
+      return wavemix.main(list(argv))
+
+  def test_output_add_appends_and_rebuilds(self):
+    self.assertEqual(self.run_cli("device", "output-add", "b"), 0)
+
+    self.assertEqual(self.state["devices"]["outputs"], ["a", "b"])
+    self.assertEqual(self.state["devices"]["output"], "a")
+    self.save_mock.assert_called_once_with(self.state)
+    self.up_mock.assert_called_once_with(self.state)
+
+  def test_output_add_rejects_duplicates_and_virtual_devices(self):
+    for name in ("a", "wavemix_browser"):
+      with self.subTest(name=name):
+        with contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as raised:
+          wavemix.main(["device", "output-add", name])
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertEqual(self.state["devices"]["outputs"], ["a"])
+        self.save_mock.assert_not_called()
+        self.up_mock.assert_not_called()
+
+  def test_output_remove_refuses_the_last_output(self):
+    with contextlib.redirect_stderr(io.StringIO()), \
+         self.assertRaises(SystemExit) as raised:
+      wavemix.main(["device", "output-remove", "a"])
+
+    self.assertNotEqual(raised.exception.code, 0)
+    self.assertEqual(self.state["devices"]["outputs"], ["a"])
+    self.assertEqual(self.state["devices"]["output"], "a")
+    self.save_mock.assert_not_called()
+    self.up_mock.assert_not_called()
+
+  def test_output_remove_keeps_the_primary(self):
+    self.state["devices"].update({"output": "a", "outputs": ["a", "b"]})
+
+    self.assertEqual(self.run_cli("device", "output-remove", "b"), 0)
+
+    self.assertEqual(self.state["devices"]["outputs"], ["a"])
+    self.assertEqual(self.state["devices"]["output"], "a")
+    self.up_mock.assert_called_once_with(self.state)
+
+  def test_output_remove_promotes_the_next_output(self):
+    self.state["devices"].update({"output": "a", "outputs": ["a", "b", "c"]})
+
+    self.assertEqual(self.run_cli("device", "output-remove", "a"), 0)
+
+    self.assertEqual(self.state["devices"]["outputs"], ["b", "c"])
+    self.assertEqual(self.state["devices"]["output"], "b")
+    self.up_mock.assert_called_once_with(self.state)
+
+  def test_output_moves_the_name_to_the_front_and_keeps_others(self):
+    self.state["devices"].update({"output": "a", "outputs": ["a", "b", "c"]})
+
+    self.assertEqual(self.run_cli("device", "output", "b"), 0)
+
+    self.assertEqual(self.state["devices"]["outputs"], ["b", "a", "c"])
+    self.assertEqual(self.state["devices"]["output"], "b")
+    self.up_mock.assert_called_once_with(self.state)
+
+  def test_device_input_stays_a_single_device(self):
+    self.assertEqual(self.run_cli("device", "input", "mic2"), 0)
+
+    self.assertEqual(self.state["devices"]["input"], "mic2")
+    self.assertEqual(self.state["devices"]["outputs"], ["a"])
+    self.assertEqual(self.state["devices"]["output"], "a")
+    self.up_mock.assert_called_once_with(self.state)
+
+  def test_devices_json_includes_selected_outputs(self):
+    self.state["devices"].update({"output": "a", "outputs": ["a", "b"]})
+
+    def hardware(which):
+      if which == "output":
+        return [{"name": "a", "description": "A"},
+                {"name": "b", "description": "B"}]
+      return [{"name": "mic", "description": "Mic"}]
+
+    output = io.StringIO()
+    with patch.object(wavemix, "hardware_devices", side_effect=hardware), \
+         patch.object(wavemix, "sh", return_value=""), \
+         contextlib.redirect_stdout(output):
+      self.assertEqual(wavemix.main(["devices", "--json"]), 0)
+
+    selected = json.loads(output.getvalue())["selected"]
+    self.assertEqual(selected["outputs"], ["a", "b"])
+    self.assertEqual(selected["output"], "a")
+
+  def test_mute_toggle_applies_to_every_output(self):
+    self.state["devices"]["outputs"] = ["a", "b"]
+    devices = [{"name": "a", "mute": False}, {"name": "b", "mute": True}]
+    calls = []
+
+    def fake_sh(*args):
+      calls.append(args)
+      return ""
+
+    with patch.object(wavemix, "sinks", return_value=devices), \
+         patch.object(wavemix, "sh", side_effect=fake_sh), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(wavemix.main(["mute", "output", "toggle"]), 0)
+
+    applied = [call for call in calls if call[1] == "set-sink-mute"]
+    self.assertEqual({call[2] for call in applied}, {"a", "b"})
+    self.assertEqual({call[3] for call in applied}, {"1"})
+
+  def test_mute_on_and_off_apply_to_every_output(self):
+    self.state["devices"]["outputs"] = ["a", "b"]
+    for action, value in (("on", "1"), ("off", "0")):
+      with self.subTest(action=action):
+        calls = []
+
+        def fake_sh(*args):
+          calls.append(args)
+          return ""
+
+        with patch.object(wavemix, "sinks", return_value=[]), \
+             patch.object(wavemix, "sh", side_effect=fake_sh), \
+             contextlib.redirect_stdout(io.StringIO()):
+          self.assertEqual(
+            wavemix.main(["mute", "output", action]), 0)
+
+        applied = [call for call in calls if call[1] == "set-sink-mute"]
+        self.assertEqual({call[2] for call in applied}, {"a", "b"})
+        self.assertEqual({call[3] for call in applied}, {value})
+
+  def test_input_mute_stays_single_device(self):
+    calls = []
+
+    def fake_sh(*args):
+      calls.append(args)
+      return ""
+
+    with patch.object(wavemix, "sources",
+                      return_value=[{"name": "mic", "mute": False}]), \
+         patch.object(wavemix, "sh", side_effect=fake_sh), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(wavemix.main(["mute", "input", "on"]), 0)
+
+    applied = [call for call in calls if call[1].startswith("set-")]
+    self.assertEqual(applied, [("pactl", "set-source-mute", "mic", "1")])
+
+  def test_mutes_reports_output_true_only_when_all_are_muted(self):
+    for mutes, expected in (((False, True), False), ((True, True), True)):
+      with self.subTest(mutes=mutes):
+        devices = [{"name": "a", "mute": mutes[0]},
+                   {"name": "b", "mute": mutes[1]}]
+        self.state["devices"]["outputs"] = ["a", "b"]
+        output = io.StringIO()
+        with patch.object(wavemix, "sinks", return_value=devices), \
+             patch.object(wavemix, "sources", return_value=[]), \
+             contextlib.redirect_stdout(output):
+          self.assertEqual(wavemix.main(["mutes"]), 0)
+
+        self.assertIs(json.loads(output.getvalue())["output"], expected)
+
+
 class InstallerTests(unittest.TestCase):
   def test_installer_ships_effect_module_and_manifests(self):
     text = (ROOT / "install.sh").read_text()
