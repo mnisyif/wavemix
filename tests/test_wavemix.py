@@ -349,6 +349,133 @@ class StateTests(unittest.TestCase):
       state, self.manifests, "highpass-1"))
 
 
+class CompilerTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls._user_dir = tempfile.TemporaryDirectory()
+    cls.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    # Keep the suite hermetic: pretend the RNNoise LADSPA is installed even
+    # when this host does not have it.
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
+    cls.state_with_rnnoise = {
+      "version": 2,
+      "micFx": {"enabled": True, "chain": [
+        {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+         "controls": {}}]},
+    }
+
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
+
+  def test_empty_chain_renders_only_marker(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": []}}
+    text = wavemix_fx.render_config(state, self.manifests, "1.1.0")
+    self.assertTrue(text.startswith(wavemix_fx.GENERATED_MARKER))
+    self.assertNotIn("libpipewire-module-filter-chain", text)
+
+  def test_two_effects_render_nodes_and_link(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": True,
+       "controls": {"vadThreshold": 60, "dryMix": 25}},
+      {"id": "highpass-1", "plugin": "highpass", "enabled": True,
+       "controls": {"freq": 80, "q": 0.707}}]}}
+    text = wavemix_fx.render_config(state, self.manifests, "1.1.0")
+    self.assertIn("name = fx0", text)
+    self.assertIn('"VAD Threshold (%)" = 60', text)
+    self.assertIn('"Dry Mix" = 0.250000', text)
+    self.assertIn("name = fx1", text)
+    self.assertIn('{ output = "fx0:Output" input = "fx1:In" }', text)
+    self.assertIn('inputs = [ "fx0:Input" ]', text)
+    self.assertIn('outputs = [ "fx1:Out" ]', text)
+    self.assertIn('node.name = "wavemix_micfx.capture"', text)
+    self.assertIn('audio.position = [ MONO ]', text)
+
+  def test_disabled_and_unavailable_effects_are_skipped(self):
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "enabled": False, "controls": {}},
+      {"id": "missing-1", "plugin": "missing-plugin", "enabled": True,
+       "controls": {}},
+      {"id": "highpass-1", "plugin": "highpass", "enabled": True,
+       "controls": {}}]}}
+    text = wavemix_fx.render_config(state, self.manifests, "1.1.0")
+    # Only highpass survives, so it is the first (and only) node: fx0.
+    self.assertIn("name = fx0", text)
+    self.assertNotIn("name = fx1", text)
+    self.assertNotIn("rnnoise", text)
+    self.assertNotIn("missing", text)
+
+  def test_strings_with_spaces_and_punctuation_are_quoted(self):
+    text = wavemix_fx.render_config(
+      self.state_with_rnnoise, self.manifests, "1.1.0")
+    self.assertIn('"VAD Grace Period (ms)"', text)
+
+  def test_missing_controls_use_manifest_defaults(self):
+    text = wavemix_fx.render_config(
+      self.state_with_rnnoise, self.manifests, "1.1.0")
+    self.assertIn('"VAD Threshold (%)" = 50', text)
+    self.assertIn('"Dry Mix" = 0.000000', text)
+
+  def test_quotes_and_backslashes_are_escaped(self):
+    manifest = wavemix_fx.normalize_manifest(
+      manifest_data("demo", label='bad"label\\path'),
+      source="user", path=Path("/tmp/demo.json"), version="1.1.0")
+    state = {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "demo-1", "plugin": "demo", "enabled": True,
+       "controls": {}}]}}
+
+    text = wavemix_fx.render_config(state, {"demo": manifest}, "1.1.0")
+
+    self.assertIn('label = "bad\\"label\\\\path"', text)
+    self.assertNotIn('bad"label', text)
+
+  def test_config_path_uses_xdg_config_home(self):
+    with tempfile.TemporaryDirectory() as tmp, \
+         patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+      self.assertEqual(
+        wavemix_fx.config_path(),
+        Path(tmp) / "pipewire" / "pipewire.conf.d" /
+        "90-wavemix-micfx.conf")
+
+  def test_write_config_backs_up_handwritten_file_once(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "90-wavemix-micfx.conf"
+      path.write_text("handwritten config\n", encoding="utf-8")
+      generated = wavemix_fx.render_config(
+        self.state_with_rnnoise, self.manifests, "1.1.0")
+
+      self.assertTrue(wavemix_fx.write_config(path, generated))
+      backups = sorted(path.parent.glob(path.name + ".bak-*"))
+      self.assertEqual(len(backups), 1)
+      self.assertEqual(backups[0].read_text(encoding="utf-8"),
+                       "handwritten config\n")
+      self.assertTrue(path.read_text(encoding="utf-8").startswith(
+        wavemix_fx.GENERATED_MARKER))
+
+      self.assertFalse(wavemix_fx.write_config(path, generated))
+      self.assertEqual(
+        len(list(path.parent.glob(path.name + ".bak-*"))), 1)
+
+      # A later handwritten edit is not backed up a second time.
+      path.write_text("handwritten again\n", encoding="utf-8")
+      self.assertTrue(wavemix_fx.write_config(path, generated + "# v2\n"))
+      self.assertEqual(
+        len(list(path.parent.glob(path.name + ".bak-*"))), 1)
+
+  def test_render_to_disk_writes_and_reports_changes(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "90-wavemix-micfx.conf"
+
+      self.assertTrue(wavemix_fx.render_to_disk(
+        self.state_with_rnnoise, self.manifests, "1.1.0", path))
+      self.assertIn("libpipewire-module-filter-chain",
+                    path.read_text(encoding="utf-8"))
+      self.assertFalse(wavemix_fx.render_to_disk(
+        self.state_with_rnnoise, self.manifests, "1.1.0", path))
+
+
 PW_CLI_PROPS = """
 Object: size 288, type Spa:Pod:Object:Param:Props (262146), id Spa:Enum:ParamId:Props (2)
   Prop: key Spa:Pod:Object:Param:Props:params (524289), flags 00000000
