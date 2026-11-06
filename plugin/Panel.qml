@@ -63,6 +63,13 @@ Panel {
   property string pickChannel: ""
   property bool editing: false
 
+  // RNNoise settings popup. fxData is the JSON from `wavemix micfx controls`.
+  property bool fxOpen: false
+  property bool fxRefreshPending: false
+  property var fxData: null
+  readonly property bool fxAvailable: fxData ? fxData.available === true : true
+  readonly property bool fxRunning: fxData ? fxData.running === true : false
+
   // ---- model ---------------------------------------------------------------
   readonly property var channelIds: {
     var g = statusData && statusData.graph ? statusData.graph.channels : null
@@ -342,12 +349,36 @@ Panel {
     run(["micfx", "toggle"])
     refreshSoon()
   }
+  function refreshMicFx() {
+    if (fxControlsProc.running) {
+      root.fxRefreshPending = true
+      return
+    }
+    fxControlsProc.running = true
+  }
+  function openMicFx() {
+    if (root.opened) root.close()
+    root.fxOpen = true
+    root.refreshMicFx()
+  }
+  function setMicFx(key, value) {
+    run(["micfx", "set", key, String(value)])
+    fxRefreshSoon.restart()
+  }
 
   implicitWidth: icons.implicitWidth
   implicitHeight: icons.implicitHeight
 
+  onFxOpenChanged: if (fxOpen) root.refreshMicFx()
+  onFxDataChanged: {
+    fxModel.clear()
+    if (!fxData || !fxData.controls) return
+    for (var i = 0; i < fxData.controls.length; i++) fxModel.append(fxData.controls[i])
+  }
+
   onOpenedChanged: {
     if (opened) {
+      root.fxOpen = false
       view = "main"
       cursorIndex = 0
       editing = false
@@ -366,6 +397,8 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh(); root.refreshDevices() }
     function mute(which: string): void { root.toggleMute(which) }
+    function micfx(): void { root.openMicFx() }
+    function micfxset(key: string, value: string): void { root.setMicFx(key, value) }
   }
 
   Process {
@@ -405,6 +438,21 @@ Panel {
   }
 
   Process {
+    id: fxControlsProc
+    command: [root.bin, "micfx", "controls", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { try { root.fxData = JSON.parse(text) } catch (e) {} }
+    }
+    onExited: {
+      if (root.fxRefreshPending) {
+        root.fxRefreshPending = false
+        Qt.callLater(root.refreshMicFx)
+      }
+    }
+  }
+
+  Process {
     id: cmd
     onRunningChanged: if (!running) root.pump()
   }
@@ -414,6 +462,13 @@ Panel {
     interval: 250
     repeat: false
     onTriggered: { root.refresh(); root.refreshDevices(); root.refreshMutes() }
+  }
+
+  Timer {
+    id: fxRefreshSoon
+    interval: 500
+    repeat: false
+    onTriggered: root.refreshMicFx()
   }
 
   Timer {
@@ -456,9 +511,10 @@ Panel {
       fontSize: Style.bar.iconFont
       foreground: root.mutes.input ? Qt.darker(root.foreground, 1.7) : root.foreground
       fixedWidth: root.iconCell
-      tooltipText: "Microphone - left-click to mute, right-click for the panel"
+      tooltipText: "Microphone - left-click mute · right-click mixer · middle-click noise settings"
       onPressed: function(buttonCode) {
         if (buttonCode === Qt.RightButton) root.toggle()
+        else if (buttonCode === Qt.MiddleButton) root.openMicFx()
         else if (buttonCode === Qt.LeftButton) root.toggleMute("input")
       }
     }
@@ -471,9 +527,10 @@ Panel {
       fontSize: Style.bar.iconFont
       foreground: root.mutes.output ? Qt.darker(root.foreground, 1.7) : root.foreground
       fixedWidth: root.iconCell
-      tooltipText: "Speakers - left-click to mute, right-click for the panel"
+      tooltipText: "Speakers - left-click mute · right-click mixer · middle-click noise settings"
       onPressed: function(buttonCode) {
         if (buttonCode === Qt.RightButton) root.toggle()
+        else if (buttonCode === Qt.MiddleButton) root.openMicFx()
         else if (buttonCode === Qt.LeftButton) root.toggleMute("output")
       }
     }
@@ -787,6 +844,155 @@ Panel {
             }
           }
         }
+      }
+    }
+  }
+
+  // RNNoise settings open in their own popup so they stay reachable while the
+  // mixer panel is closed. Middle-click either bar icon, or the gear on the
+  // Noise suppression row, opens it.
+  ListModel {
+    id: fxModel
+  }
+
+  QtObject {
+    id: fxOwner
+    function close() { root.fxOpen = false }
+  }
+
+  PopupCard {
+    id: fxPopup
+    anchorItem: icons
+    bar: root.bar
+    owner: fxOwner
+    open: root.fxOpen
+    contentWidth: fxPopup.fittedContentWidth(Style.space(380))
+    contentHeight: fxPopup.fittedContentHeight(fxColumn.implicitHeight)
+
+    Column {
+      id: fxColumn
+      anchors.fill: parent
+      spacing: Style.space(10)
+
+      Item {
+        width: parent.width
+        height: Math.max(fxTitle.implicitHeight, fxClose.implicitHeight)
+
+        Text {
+          id: fxTitle
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: "NOISE SUPPRESSION"
+          textFormat: Text.PlainText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+          font.letterSpacing: 1.2
+        }
+
+        Text {
+          id: fxClose
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: String.fromCodePoint(0xf00d) // nf-fa-times
+          color: fxCloseArea.containsMouse ? Color.urgent : Qt.darker(root.foreground, 1.5)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+
+          MouseArea {
+            id: fxCloseArea
+            anchors.fill: parent
+            anchors.margins: -Style.space(5)
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.fxOpen = false
+          }
+        }
+      }
+
+      Text {
+        width: parent.width
+        text: !root.fxData ? "Loading…"
+          : !root.fxAvailable ? "The RNNoise filter-chain fragment is not installed."
+          : !root.fxRunning ? "RNNoise is not running. Restart PipeWire to load the mic FX node."
+          : "RNNoise · live. Changes apply immediately."
+        textFormat: Text.PlainText
+        color: Qt.darker(root.foreground, 1.4)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      Repeater {
+        model: fxModel
+
+        Column {
+          id: fxDelegate
+          required property int index
+          required property string key
+          required property string label
+          required property real value
+          required property real min
+          required property real max
+          required property real step
+          required property string unit
+
+          width: parent.width
+          spacing: Style.space(3)
+
+          Item {
+            width: parent.width
+            height: Math.max(fxControlLabel.implicitHeight, fxControlValue.implicitHeight)
+
+            Text {
+              id: fxControlLabel
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: fxDelegate.label
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            Text {
+              id: fxControlValue
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: fxDelegate.value + fxDelegate.unit
+              textFormat: Text.PlainText
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSlider {
+            width: parent.width
+            bar: root.bar
+            minimum: fxDelegate.min
+            maximum: fxDelegate.max
+            step: fxDelegate.step
+            integer: true
+            value: fxDelegate.value
+            enabled: root.fxRunning
+            onReleased: function(value) {
+              fxModel.setProperty(fxDelegate.index, "value", value)
+              root.setMicFx(fxDelegate.key, value)
+            }
+          }
+        }
+      }
+
+      Text {
+        width: parent.width
+        text: "VAD threshold silences frames below the voice probability. Grace keeps word starts and tails from being cut. Dry mix blends the unprocessed mic back in."
+        textFormat: Text.PlainText
+        color: Qt.darker(root.foreground, 1.55)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
       }
     }
   }
@@ -1149,6 +1355,27 @@ Panel {
       checked: root.micFxOn
       hasCursor: root.view === "main" && root.cursorIndex === fxRow.controlIndex
       foreground: root.foreground
+    }
+
+    Text {
+      id: fxGear
+      z: 2
+      anchors.right: fxSwitch.left
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      text: String.fromCodePoint(0xf013) // nf-fa-cog
+      color: fxGearArea.containsMouse ? root.foreground : Qt.darker(root.foreground, 1.4)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+
+      MouseArea {
+        id: fxGearArea
+        anchors.fill: parent
+        anchors.margins: -Style.space(4)
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.openMicFx()
+      }
     }
 
     MouseArea {
