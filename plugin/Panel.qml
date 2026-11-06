@@ -79,6 +79,16 @@ Panel {
   readonly property string fxVersion: (fxData && fxData.wavemixVersion)
     ? String(fxData.wavemixVersion) : ""
 
+  // Chain editing happens in the Effects popup: "chain" is the current chain
+  // and "add" is the plugin list. Structural commands restart audio, so only
+  // one may be in flight; fxApplying drives the notice and disables the
+  // controls until the CLI returns.
+  property string fxView: "chain" // "chain" | "add"
+  property string fxSelected: ""
+  property bool fxApplying: false
+  property string fxError: ""
+  property string fxLoadError: ""
+
   // ---- model ---------------------------------------------------------------
   readonly property var channelIds: {
     var g = statusData && statusData.graph ? statusData.graph.channels : null
@@ -297,16 +307,23 @@ Panel {
 
   // ---- commands ------------------------------------------------------------
   property var queue: []
+  property string cmdTag: ""
+  property string lastFinishedTag: ""
+  property int lastExitCode: 0
 
-  function run(args) {
-    queue = queue.concat([args])
+  // run() accepts an optional tag so a queued command can be identified when
+  // it exits (the structural fx commands need their own completion handling).
+  function run(args, tag) {
+    queue = queue.concat([{ args: args, tag: String(tag || "") }])
     pump()
   }
   function pump() {
     if (cmd.running || queue.length === 0) return
     var next = queue[0]
     queue = queue.slice(1)
-    cmd.command = [root.bin].concat(next)
+    root.cmdTag = String(next.tag || "")
+    root.lastFinishedTag = ""
+    cmd.command = [root.bin].concat(next.args)
     cmd.running = true
   }
   function refreshSoon() { settle.restart() }
@@ -419,6 +436,69 @@ Panel {
         return String(root.fxPlugins[i].name || key)
     return key === "" ? "Unknown effect" : key
   }
+  function clampFxSelection() {
+    var chain = root.fxChain
+    if (chain.length === 0) {
+      if (root.fxSelected !== "") root.fxSelected = ""
+      return
+    }
+    for (var i = 0; i < chain.length; i++) {
+      var entry = chain[i]
+      if (entry && String(entry.instance) === root.fxSelected) return
+    }
+    root.fxSelected = String(chain[0].instance || "")
+  }
+  onFxChainChanged: root.clampFxSelection()
+
+  function selectFx(instance) {
+    root.fxSelected = String(instance || "")
+  }
+  function openFxAdd() {
+    if (!root.fxData || root.fxApplying) return
+    root.fxView = "add"
+  }
+  function closeFxAdd() { root.fxView = "chain" }
+  function fxMutate(args) {
+    if (root.fxApplying) return
+    root.fxError = ""
+    root.fxApplying = true
+    run(args, "fxapply")
+  }
+  function fxAddEffect(pluginId) {
+    if (root.fxApplying || !root.fxData) return
+    root.fxView = "chain"
+    root.fxMutate(["fx", "add", String(pluginId)])
+  }
+  function fxToggleEffect(instance) {
+    root.fxMutate(["fx", "toggle", String(instance)])
+  }
+  function fxRemoveEffect(instance) {
+    root.fxMutate(["fx", "remove", String(instance)])
+  }
+  function fxMoveEffect(instance, direction) {
+    if (direction !== "up" && direction !== "down") return
+    root.fxMutate(["fx", "move", String(instance), direction])
+  }
+  function fxShortError(text) {
+    var lines = String(text || "").split("\n")
+    for (var i = lines.length - 1; i >= 0; i--) {
+      var line = lines[i].trim()
+      if (line !== "") return line
+    }
+    return ""
+  }
+  function finishFxCommand(exitCode) {
+    root.fxApplying = false
+    if (exitCode !== 0) {
+      var detail = root.fxShortError(cmdErr.text)
+      root.fxError = detail !== ""
+        ? "Could not change effects: " + detail
+        : "Could not change effects."
+    } else {
+      root.fxError = ""
+    }
+    fxRefreshSoon.restart()
+  }
   function refreshFxState() {
     if (fxStateProc.running) {
       root.fxRefreshPending = true
@@ -428,11 +508,14 @@ Panel {
   }
   function openMicFx() {
     if (root.opened) root.close()
+    root.fxView = "chain"
+    root.fxError = ""
+    root.fxLoadError = ""
     root.fxOpen = true
     root.refreshFxState()
   }
   function toggleFxMaster() {
-    if (!root.fxData) return
+    if (!root.fxData || root.fxApplying) return
     run(["fx", root.fxEnabled ? "disable" : "enable"])
   }
   function setMicFx(key, value) {
@@ -513,9 +596,26 @@ Panel {
     command: [root.bin, "fx", "state", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: { try { root.fxData = JSON.parse(text) } catch (e) {} }
+      onStreamFinished: {
+        try {
+          root.fxData = JSON.parse(text)
+          root.fxLoadError = ""
+        } catch (e) {
+          root.fxLoadError = "Could not load effects."
+        }
+      }
     }
-    onExited: {
+    stderr: StdioCollector {
+      id: fxStateErr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var detail = root.fxShortError(fxStateErr.text)
+        root.fxLoadError = detail !== ""
+          ? "Could not load effects: " + detail
+          : "Could not load effects."
+      }
       if (root.fxRefreshPending) {
         root.fxRefreshPending = false
         Qt.callLater(root.refreshFxState)
@@ -525,10 +625,28 @@ Panel {
 
   Process {
     id: cmd
+    stderr: StdioCollector {
+      id: cmdErr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      // Record which command exited before runningChanged starts the next one.
+      root.lastFinishedTag = root.cmdTag
+      root.lastExitCode = exitCode
+    }
     onRunningChanged: {
       if (running) return
-      root.pump()
-      if (root.fxOpen && root.queue.length === 0) fxRefreshSoon.restart()
+      Qt.callLater(function() {
+        if (root.lastFinishedTag === "fxapply") {
+          root.finishFxCommand(root.lastExitCode)
+          root.lastFinishedTag = ""
+        }
+        root.pump()
+        // After the queue drains (and nothing else took its place), refresh the
+        // chain. Testing queue.length here would schedule a refresh while the
+        // next command is already running.
+        if (root.fxOpen && !cmd.running) fxRefreshSoon.restart()
+      })
     }
   }
 
@@ -1066,53 +1184,192 @@ Panel {
         }
       }
 
-      Item {
+      Column {
         width: parent.width
-        implicitHeight: Math.max(fxMasterLabel.implicitHeight,
-                                 fxMasterSwitch.implicitHeight)
+        spacing: Style.space(10)
+        visible: root.fxView === "chain"
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(fxMasterLabel.implicitHeight,
+                                   fxMasterSwitch.implicitHeight)
+
+          Text {
+            id: fxMasterLabel
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Microphone effects"
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          ToggleSwitch {
+            id: fxMasterSwitch
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            checked: root.fxEnabled
+            enabled: root.fxData !== null && !root.fxApplying
+            foreground: root.foreground
+            onToggled: root.toggleFxMaster()
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
 
         Text {
-          id: fxMasterLabel
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Microphone effects"
+          width: parent.width
+          visible: root.fxApplying
+          text: "Applying… audio restarts briefly"
           textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+          wrapMode: Text.WordWrap
         }
 
-        ToggleSwitch {
-          id: fxMasterSwitch
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          checked: root.fxEnabled
-          enabled: root.fxData !== null
-          foreground: root.foreground
-          onToggled: root.toggleFxMaster()
+        Text {
+          width: parent.width
+          visible: root.fxError !== ""
+          text: root.fxError
+          textFormat: Text.PlainText
+          color: Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          width: parent.width
+          visible: root.fxLoadError !== ""
+          text: root.fxLoadError
+          textFormat: Text.PlainText
+          color: Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          width: parent.width
+          visible: root.fxData === null && root.fxLoadError === ""
+          text: "Loading…"
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.4)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          width: parent.width
+          visible: root.fxData !== null && root.fxChain.length === 0
+          text: "No effects. Add one."
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.4)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Repeater {
+          model: root.fxChain
+
+          FxChainRow {
+            required property var modelData
+            required property int index
+            width: fxColumn.width
+            entry: modelData
+            position: index
+            count: root.fxChain.length
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Item {
+          width: parent.width
+          implicitHeight: fxAddText.implicitHeight + Style.space(8)
+
+          Text {
+            id: fxAddText
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "+  Add effect"
+            textFormat: Text.PlainText
+            color: (!root.fxData || root.fxApplying)
+              ? Qt.darker(root.foreground, 1.8)
+              : (fxAddArea.containsMouse ? root.foreground
+                                         : Qt.darker(root.foreground, 1.3))
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          MouseArea {
+            id: fxAddArea
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: root.fxData !== null && !root.fxApplying
+            cursorShape: fxAddArea.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: root.openFxAdd()
+          }
         }
       }
 
-      PanelSeparator { foreground: root.foreground }
-
-      Text {
+      Column {
         width: parent.width
-        visible: root.fxChain.length === 0
-        text: root.fxData ? "No effects. Add one." : "Loading…"
-        textFormat: Text.PlainText
-        color: Qt.darker(root.foreground, 1.4)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-      }
+        spacing: Style.space(8)
+        visible: root.fxView === "add"
 
-      Repeater {
-        model: root.fxChain
+        Item {
+          width: parent.width
+          implicitHeight: fxBackText.implicitHeight + Style.space(4)
 
-        FxChainRow {
-          required property var modelData
-          required property int index
-          width: fxColumn.width
-          entry: modelData
+          Text {
+            id: fxBackText
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "‹  Back to effects"
+            textFormat: Text.PlainText
+            color: fxBackArea.containsMouse ? root.foreground
+                                            : Qt.darker(root.foreground, 1.3)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          MouseArea {
+            id: fxBackArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.closeFxAdd()
+          }
+        }
+
+        PanelSectionHeader {
+          text: "ADD EFFECT"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Text {
+          width: parent.width
+          visible: root.fxPlugins.length === 0
+          text: "No plugins found."
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.4)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Repeater {
+          model: root.fxPlugins
+
+          FxPluginRow {
+            required property var modelData
+            width: fxColumn.width
+            plugin: modelData
+          }
         }
       }
     }
@@ -1120,9 +1377,11 @@ Panel {
 
   // ---------------------------------------------------------------- components
 
-  component FxChainRow: Item {
+  component FxChainRow: CursorSurface {
     id: chainRow
     property var entry: null
+    property int position: 0
+    property int count: 0
 
     readonly property string pluginId: (chainRow.entry && chainRow.entry.plugin)
       ? String(chainRow.entry.plugin) : ""
@@ -1132,8 +1391,17 @@ Panel {
       : chainRow.entry.available === false ? "unavailable"
       : chainRow.entry.enabled === false ? "bypassed" : ""
 
-    implicitHeight: Math.max(chainName.implicitHeight, chainState.implicitHeight)
-      + Style.space(8)
+    hasCursor: root.fxSelected === chainRow.instanceId
+    foreground: root.foreground
+    implicitHeight: Math.max(chainName.implicitHeight,
+                             chainActions.implicitHeight) + Style.space(8)
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.selectFx(chainRow.instanceId)
+    }
 
     Row {
       anchors.left: parent.left
@@ -1141,11 +1409,13 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.space(6)
       anchors.rightMargin: Style.space(6)
-      spacing: Style.space(8)
+      spacing: Style.space(6)
 
       Text {
         id: chainName
-        width: parent.width - chainState.width - parent.spacing
+        width: Math.max(0, parent.width - chainActions.width
+          - (chainState.visible ? chainState.width + parent.spacing : 0)
+          - parent.spacing)
         anchors.verticalCenter: parent.verticalCenter
         text: root.fxPluginName(chainRow.pluginId)
           + (chainRow.instanceId !== "" ? " · " + chainRow.instanceId : "")
@@ -1168,6 +1438,187 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
       }
+
+      Row {
+        id: chainActions
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(2)
+
+        PanelActionButton {
+          iconText: chainRow.entry && chainRow.entry.enabled === false
+            ? String.fromCodePoint(0xf070) // nf-fa-eye_slash
+            : String.fromCodePoint(0xf06e) // nf-fa-eye
+          tooltipText: chainRow.entry && chainRow.entry.enabled === false
+            ? "Enable effect" : "Bypass effect"
+          enabled: !root.fxApplying
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.fxToggleEffect(chainRow.instanceId)
+        }
+
+        PanelActionButton {
+          iconText: String.fromCodePoint(0xf077) // nf-fa-chevron_up
+          tooltipText: "Move up"
+          enabled: !root.fxApplying && chainRow.position > 0
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.fxMoveEffect(chainRow.instanceId, "up")
+        }
+
+        PanelActionButton {
+          iconText: String.fromCodePoint(0xf078) // nf-fa-chevron_down
+          tooltipText: "Move down"
+          enabled: !root.fxApplying && chainRow.position < chainRow.count - 1
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.fxMoveEffect(chainRow.instanceId, "down")
+        }
+
+        PanelActionButton {
+          iconText: String.fromCodePoint(0xf00d) // nf-fa-times
+          tooltipText: "Remove effect"
+          enabled: !root.fxApplying
+          foreground: root.foreground
+          hoverColor: Color.urgent
+          fontFamily: root.fontFamily
+          onClicked: root.fxRemoveEffect(chainRow.instanceId)
+        }
+      }
+    }
+  }
+
+  component FxPluginRow: CursorSurface {
+    id: pluginRow
+    property var plugin: null
+
+    readonly property bool available: pluginRow.plugin
+      ? pluginRow.plugin.available === true : false
+    readonly property bool gpu: pluginRow.plugin
+      ? pluginRow.plugin.gpu === true : false
+    readonly property string pluginId: pluginRow.plugin
+      ? String(pluginRow.plugin.id || "") : ""
+    readonly property string pluginName: pluginRow.plugin
+      ? String(pluginRow.plugin.name || pluginRow.pluginId) : ""
+    readonly property string pluginVersion: pluginRow.plugin
+      ? String(pluginRow.plugin.version || "") : ""
+    readonly property string pluginSource: pluginRow.plugin
+      ? String(pluginRow.plugin.source || "") : ""
+    readonly property string pluginDescription: pluginRow.plugin
+      ? String(pluginRow.plugin.description || "") : ""
+    readonly property string pluginRequires: pluginRow.plugin
+      ? String(pluginRow.plugin.requires || "") : ""
+    readonly property string pluginError: pluginRow.plugin
+      ? String(pluginRow.plugin.error || "") : ""
+
+    hasCursor: pluginRow.available && pluginMouse.containsMouse
+    foreground: root.foreground
+    implicitHeight: pluginBody.implicitHeight + Style.space(12)
+
+    Column {
+      id: pluginBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(2)
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Text {
+          id: addName
+          width: Math.max(0, parent.width - addVersion.width
+            - (addGpu.visible ? addGpu.width + parent.spacing : 0)
+            - parent.spacing)
+          anchors.verticalCenter: parent.verticalCenter
+          text: pluginRow.pluginName
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          color: pluginRow.available ? root.foreground
+                                     : Qt.darker(root.foreground, 1.9)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          id: addGpu
+          anchors.verticalCenter: parent.verticalCenter
+          visible: pluginRow.gpu
+          text: "GPU"
+          textFormat: Text.PlainText
+          color: pluginRow.available ? Color.accent
+                                     : Qt.darker(root.foreground, 1.9)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+
+        Text {
+          id: addVersion
+          anchors.verticalCenter: parent.verticalCenter
+          text: "v" + pluginRow.pluginVersion
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.5)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: pluginRow.pluginDescription !== ""
+        text: pluginRow.pluginDescription
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: pluginRow.available ? Qt.darker(root.foreground, 1.2)
+                                   : Qt.darker(root.foreground, 1.9)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        width: parent.width
+        text: pluginRow.pluginSource
+          + (pluginRow.available ? "" : " · unavailable")
+        textFormat: Text.PlainText
+        color: pluginRow.available ? Qt.darker(root.foreground, 1.5)
+                                   : Color.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        width: parent.width
+        visible: pluginRow.pluginRequires !== ""
+        text: pluginRow.pluginRequires
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: Qt.darker(root.foreground, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        width: parent.width
+        visible: pluginRow.pluginError !== ""
+        text: pluginRow.pluginError
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: Color.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    MouseArea {
+      id: pluginMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      enabled: pluginRow.available
+      cursorShape: pluginRow.available ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: root.fxAddEffect(pluginRow.pluginId)
     }
   }
 
