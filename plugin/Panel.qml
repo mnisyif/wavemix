@@ -66,12 +66,18 @@ Panel {
   // be removed, so the click is refused rather than sent to the CLI).
   property string outputNotice: ""
 
-  // RNNoise settings popup. fxData is the JSON from `wavemix micfx controls`.
+  // Effects popup. fxData is the JSON from `wavemix fx state`.
   property bool fxOpen: false
   property bool fxRefreshPending: false
   property var fxData: null
-  readonly property bool fxAvailable: fxData ? fxData.available === true : true
+  readonly property var fxChain: (fxData && fxData.chain
+    && typeof fxData.chain.length === "number") ? fxData.chain : []
+  readonly property var fxPlugins: (fxData && fxData.plugins
+    && typeof fxData.plugins.length === "number") ? fxData.plugins : []
+  readonly property bool fxEnabled: fxData ? fxData.enabled === true : false
   readonly property bool fxRunning: fxData ? fxData.running === true : false
+  readonly property string fxVersion: (fxData && fxData.wavemixVersion)
+    ? String(fxData.wavemixVersion) : ""
 
   // ---- model ---------------------------------------------------------------
   readonly property var channelIds: {
@@ -406,17 +412,28 @@ Panel {
     run(["micfx", "toggle"])
     refreshSoon()
   }
-  function refreshMicFx() {
-    if (fxControlsProc.running) {
+  function fxPluginName(id) {
+    var key = String(id || "")
+    for (var i = 0; i < root.fxPlugins.length; i++)
+      if (String(root.fxPlugins[i].id) === key)
+        return String(root.fxPlugins[i].name || key)
+    return key === "" ? "Unknown effect" : key
+  }
+  function refreshFxState() {
+    if (fxStateProc.running) {
       root.fxRefreshPending = true
       return
     }
-    fxControlsProc.running = true
+    fxStateProc.running = true
   }
   function openMicFx() {
     if (root.opened) root.close()
     root.fxOpen = true
-    root.refreshMicFx()
+    root.refreshFxState()
+  }
+  function toggleFxMaster() {
+    if (!root.fxData) return
+    run(["fx", root.fxEnabled ? "disable" : "enable"])
   }
   function setMicFx(key, value) {
     run(["micfx", "set", key, String(value)])
@@ -426,12 +443,7 @@ Panel {
   implicitWidth: icons.implicitWidth
   implicitHeight: icons.implicitHeight
 
-  onFxOpenChanged: if (fxOpen) root.refreshMicFx()
-  onFxDataChanged: {
-    fxModel.clear()
-    if (!fxData || !fxData.controls) return
-    for (var i = 0; i < fxData.controls.length; i++) fxModel.append(fxData.controls[i])
-  }
+  onFxOpenChanged: if (fxOpen) root.refreshFxState()
 
   onOpenedChanged: {
     if (opened) {
@@ -456,6 +468,7 @@ Panel {
     function refresh(): void { root.refresh(); root.refreshDevices() }
     function mute(which: string): void { root.toggleMute(which) }
     function micfx(): void { root.openMicFx() }
+    function fx(): void { root.openMicFx() }
     function micfxset(key: string, value: string): void { root.setMicFx(key, value) }
   }
 
@@ -496,8 +509,8 @@ Panel {
   }
 
   Process {
-    id: fxControlsProc
-    command: [root.bin, "micfx", "controls", "--json"]
+    id: fxStateProc
+    command: [root.bin, "fx", "state", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: { try { root.fxData = JSON.parse(text) } catch (e) {} }
@@ -505,14 +518,18 @@ Panel {
     onExited: {
       if (root.fxRefreshPending) {
         root.fxRefreshPending = false
-        Qt.callLater(root.refreshMicFx)
+        Qt.callLater(root.refreshFxState)
       }
     }
   }
 
   Process {
     id: cmd
-    onRunningChanged: if (!running) root.pump()
+    onRunningChanged: {
+      if (running) return
+      root.pump()
+      if (root.fxOpen && root.queue.length === 0) fxRefreshSoon.restart()
+    }
   }
 
   Timer {
@@ -533,7 +550,7 @@ Panel {
     id: fxRefreshSoon
     interval: 500
     repeat: false
-    onTriggered: root.refreshMicFx()
+    onTriggered: root.refreshFxState()
   }
 
   Timer {
@@ -976,13 +993,9 @@ Panel {
     }
   }
 
-  // RNNoise settings open in their own popup so they stay reachable while the
-  // mixer panel is closed. Middle-click either bar icon, or the gear on the
+  // Effects open in their own popup so they stay reachable while the mixer
+  // panel is closed. Middle-click either bar icon, or the gear on the
   // Noise suppression row, opens it.
-  ListModel {
-    id: fxModel
-  }
-
   QtObject {
     id: fxOwner
     function close() { root.fxOpen = false }
@@ -1004,19 +1017,33 @@ Panel {
 
       Item {
         width: parent.width
-        height: Math.max(fxTitle.implicitHeight, fxClose.implicitHeight)
+        implicitHeight: Math.max(fxHeading.implicitHeight, fxClose.implicitHeight)
 
-        Text {
-          id: fxTitle
+        Column {
+          id: fxHeading
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
-          text: "NOISE SUPPRESSION"
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
-          font.letterSpacing: 1.2
+          spacing: Style.space(2)
+
+          Text {
+            id: fxTitle
+            text: "EFFECTS"
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            font.letterSpacing: 1.2
+          }
+
+          Text {
+            id: fxVersion
+            text: root.fxVersion !== "" ? "Wavemix " + root.fxVersion : "Wavemix"
+            textFormat: Text.PlainText
+            color: Qt.darker(root.foreground, 1.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
         }
 
         Text {
@@ -1039,93 +1066,110 @@ Panel {
         }
       }
 
-      Text {
+      Item {
         width: parent.width
-        text: !root.fxData ? "Loading…"
-          : !root.fxAvailable ? "The RNNoise filter-chain fragment is not installed."
-          : !root.fxRunning ? "RNNoise is not running. Restart PipeWire to load the mic FX node."
-          : "RNNoise · live. Changes apply immediately."
-        textFormat: Text.PlainText
-        color: Qt.darker(root.foreground, 1.4)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-      }
+        implicitHeight: Math.max(fxMasterLabel.implicitHeight,
+                                 fxMasterSwitch.implicitHeight)
 
-      Repeater {
-        model: fxModel
+        Text {
+          id: fxMasterLabel
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Microphone effects"
+          textFormat: Text.PlainText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
 
-        Column {
-          id: fxDelegate
-          required property int index
-          required property string key
-          required property string label
-          required property real value
-          required property real min
-          required property real max
-          required property real step
-          required property string unit
-
-          width: parent.width
-          spacing: Style.space(3)
-
-          Item {
-            width: parent.width
-            height: Math.max(fxControlLabel.implicitHeight, fxControlValue.implicitHeight)
-
-            Text {
-              id: fxControlLabel
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: fxDelegate.label
-              textFormat: Text.PlainText
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-
-            Text {
-              id: fxControlValue
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: fxDelegate.value + fxDelegate.unit
-              textFormat: Text.PlainText
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          PanelSlider {
-            width: parent.width
-            bar: root.bar
-            minimum: fxDelegate.min
-            maximum: fxDelegate.max
-            step: fxDelegate.step
-            integer: true
-            value: fxDelegate.value
-            enabled: root.fxRunning
-            onReleased: function(value) {
-              fxModel.setProperty(fxDelegate.index, "value", value)
-              root.setMicFx(fxDelegate.key, value)
-            }
-          }
+        ToggleSwitch {
+          id: fxMasterSwitch
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.fxEnabled
+          enabled: root.fxData !== null
+          foreground: root.foreground
+          onToggled: root.toggleFxMaster()
         }
       }
 
+      PanelSeparator { foreground: root.foreground }
+
       Text {
         width: parent.width
-        text: "VAD threshold silences frames below the voice probability. Grace keeps word starts and tails from being cut. Dry mix blends the unprocessed mic back in."
+        visible: root.fxChain.length === 0
+        text: root.fxData ? "No effects. Add one." : "Loading…"
         textFormat: Text.PlainText
-        color: Qt.darker(root.foreground, 1.55)
+        color: Qt.darker(root.foreground, 1.4)
         font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.WordWrap
+        font.pixelSize: Style.font.body
+      }
+
+      Repeater {
+        model: root.fxChain
+
+        FxChainRow {
+          required property var modelData
+          required property int index
+          width: fxColumn.width
+          entry: modelData
+        }
       }
     }
   }
 
   // ---------------------------------------------------------------- components
+
+  component FxChainRow: Item {
+    id: chainRow
+    property var entry: null
+
+    readonly property string pluginId: (chainRow.entry && chainRow.entry.plugin)
+      ? String(chainRow.entry.plugin) : ""
+    readonly property string instanceId: (chainRow.entry && chainRow.entry.instance)
+      ? String(chainRow.entry.instance) : ""
+    readonly property string stateText: !chainRow.entry ? ""
+      : chainRow.entry.available === false ? "unavailable"
+      : chainRow.entry.enabled === false ? "bypassed" : ""
+
+    implicitHeight: Math.max(chainName.implicitHeight, chainState.implicitHeight)
+      + Style.space(8)
+
+    Row {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      Text {
+        id: chainName
+        width: parent.width - chainState.width - parent.spacing
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.fxPluginName(chainRow.pluginId)
+          + (chainRow.instanceId !== "" ? " · " + chainRow.instanceId : "")
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: chainRow.entry && chainRow.entry.enabled === false
+          ? Qt.darker(root.foreground, 1.6) : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        id: chainState
+        anchors.verticalCenter: parent.verticalCenter
+        visible: chainRow.stateText !== ""
+        text: chainRow.stateText
+        textFormat: Text.PlainText
+        color: chainRow.entry && chainRow.entry.available === false
+          ? Color.urgent : Qt.darker(root.foreground, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+  }
 
   component CheckBox: Item {
     id: box
