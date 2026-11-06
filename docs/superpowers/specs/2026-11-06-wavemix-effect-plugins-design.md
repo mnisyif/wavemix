@@ -12,6 +12,11 @@ chain. Effects are native PipeWire filter-chain nodes (LADSPA, LV2, or
 builtin), described by versioned manifests. Users can add, remove, reorder,
 bypass, and combine effects, and tune each effect's controls live.
 
+The output mix can also be duplicated to any number of selected hardware
+outputs. Each channel's output send creates one loopback per selected output;
+one channel fader controls every copy, so speakers and headphones receive the
+same mix.
+
 This also gives GPU noise suppression a path: NVIDIA Maxine and DeepFilterNet
 already ship LADSPA plugins, so they are normal effect manifests. Wavemix does
 not bundle proprietary GPU runtimes or implement DSP itself.
@@ -24,6 +29,8 @@ not bundle proprietary GPU runtimes or implement DSP itself.
 - Discover bundled and user-installed effect manifests.
 - Support LADSPA, LV2, and builtin nodes, including GPU-backed LADSPA plugins.
 - Track core, manifest, plugin, and state versions.
+- Play the same output mix to any number of selected hardware outputs.
+- Keep one per-channel output fader controlling every output copy.
 - Preserve the existing mic bus, virtual mic, per-channel meters, and routing.
 - Keep the current RNNoise controls working through migration.
 
@@ -31,6 +38,9 @@ not bundle proprietary GPU runtimes or implement DSP itself.
 
 - External process or daemon plugins (EasyEffects, `maxine-pipewire` daemon).
 - Effects on channels or sends other than the microphone.
+- Independent volume or mute per output; multi-output uses one shared send
+  level.
+- Per-channel output-device routing.
 - Bundling proprietary GPU runtimes or models.
 - Stereo or multi-channel microphone effect chains; the mic chain is mono.
 - Presets, update checking, or a plugin marketplace.
@@ -48,6 +58,8 @@ not bundle proprietary GPU runtimes or implement DSP itself.
 - `up()` links the hardware mic to `wavemix_micfx.capture` and the chain output
   to `wavemix_micbus`; `mic_source()` uses `wavemix_micbus.monitor` when mic FX
   is enabled.
+- A single physical output (`devices.output`) receives every channel's output
+  send.
 
 ## Architecture
 
@@ -80,6 +92,34 @@ wavemix_micbus → Wavemix-Mic
   regenerate the config and restart PipeWire briefly.
 - Control changes use `pw-cli set-param` on the live node and rewrite the
   config for the next restart, without interrupting audio.
+
+### Multi-device output
+
+```text
+channel capture ──loopback──> output A
+                └─loopback──> output B
+                └─loopback──> output C
+```
+
+- `devices.outputs` is the ordered list of selected hardware outputs.
+  `devices.output` remains the first/primary output for backward
+  compatibility and default-sink handling.
+- Each channel's `output` send creates one loopback per selected output. The
+  input send remains a single loopback to the stream bus.
+- The per-channel output fader and mute apply to every output copy through the
+  shared `wavemix=<channel>:output` stream tag.
+- The mix is identical on every selected output; there is no per-output
+  volume in v1.
+- Adding or removing an output rebuilds the graph with `up()`; existing
+  channels gain or lose the corresponding loopback.
+- At least one output must stay selected. Removing the last output is
+  rejected. A vanished or virtual output is removed during sanitization and
+  replaced by the default hardware sink if the list would become empty.
+- The speaker mute toggles every selected output: `output` is considered
+  muted only when all selected outputs are muted; toggling mutes all when any
+  is live, or unmutes all when all are muted.
+- `status` reports the selected output targets and whether every target has a
+  live loopback.
 
 ## Versioning and compatibility
 
@@ -275,6 +315,14 @@ The state gains `version: 2` and a chain:
 ```json
 {
   "version": 2,
+  "devices": {
+    "output": "alsa_output.usb-speakers",
+    "outputs": [
+      "alsa_output.usb-speakers",
+      "alsa_output.pci-headphones"
+    ],
+    "input": "alsa_input.usb-mic"
+  },
   "micFx": {
     "enabled": true,
     "chain": [
@@ -303,6 +351,8 @@ The state gains `version: 2` and a chain:
 ```
 
 - `micFx.enabled` remains the master switch.
+- `devices.outputs` is the ordered selected-output list; `devices.output` is
+  its first entry. A missing or empty list migrates to `[devices.output]`.
 - Chain array order is processing order.
 - `enabled: false` is a bypass: the instance is kept but excluded from the
   compiled chain.
@@ -445,6 +495,25 @@ Behavior:
 - `micfx controls` and `micfx set` map to the first `rnnoise` instance for
   backward compatibility; they are documented as legacy in the README.
 
+Device commands:
+
+```sh
+wavemix device output <name>          # set the primary output; keeps other selected outputs
+wavemix device output-add <name>      # add another hardware output
+wavemix device output-remove <name>   # remove one; the last output cannot be removed
+wavemix device input <name>
+```
+
+- `devices --json` adds `selected.outputs` (the ordered list) alongside the
+  existing `selected.output` primary.
+- `device output <name>` moves that device to the front of `outputs` and
+  preserves the other selected devices.
+- `output-add` refuses duplicates and virtual/bus nodes; `output-remove`
+  refuses to remove the last selected output.
+- `mutes` reports `output: true` only when every selected output is muted.
+- `mute output on|off|toggle` applies to every selected output. `toggle` uses
+  the all-muted definition above.
+
 JSON shapes are stable enough for the popup and scripts; all commands exit
 non-zero with a message on validation or runtime failure.
 
@@ -480,6 +549,23 @@ The existing Noise Suppression popup becomes an Effects popup:
   - `micfxset` remains a compatibility hook for the first RNNoise instance
   - a new `fx` method opens the popup
 - The popup fetches `fx state --json` on open and after every mutation.
+
+## Mixer output picker
+
+The mixer's Devices section keeps the existing primary **Output** dropdown and
+adds an **Also play to** checkbox list beneath it:
+
+- the primary output is always selected;
+- each additional hardware output can be checked or unchecked;
+- unchecking the last selected output is refused with a short notice;
+- the per-channel `out` row shows `out ×N` when more than one output is
+  selected;
+- the hero speaker toggle and the bar speaker icon mute or unmute every
+  selected output together;
+- the existing Default out dropdown is unchanged.
+
+The additional-output list is mouse-driven; the primary output dropdown keeps
+its current keyboard control index.
 
 ## Installation and repository layout
 
@@ -525,6 +611,11 @@ install.sh
 - PipeWire restart failure: report the error; state and config remain; retry
   with `fx apply`.
 - Live control failure: store the value and report `applied: false`.
+- Multi-output: removing the last selected output is rejected; a vanished or
+  virtual output is dropped during sanitization; if the list becomes empty,
+  the default hardware sink is selected.
+- Mixed output mute states: `output` is muted only when every selected output
+  is muted; toggling from a mixed state mutes all.
 - Version mismatch: `minWavemix`/schema errors are advisory per manifest;
   a newer state version is fatal and does not overwrite anything.
 - The generated config is validated by unit tests and inspected for balanced
@@ -558,6 +649,9 @@ Unit tests cover:
 - Atomic config rendering, generated marker, and backup behavior.
 - CLI JSON shapes for `fx plugins` and `fx state`.
 - Escaping of quoted config values.
+- Multi-output: target-list construction, one loopback per selected output,
+  shared-tag volume/mute application, all-output mute semantics, output
+  add/remove, last-output rejection, and `devices`/`status` JSON.
 
 Manual verification:
 
@@ -572,6 +666,11 @@ Manual verification:
   disabled state.
 - Break a manifest deliberately; confirm the error is visible and the rest of
   the chain still works.
+- Select two hardware outputs; confirm both receive the same mix and the
+  per-channel output fader/mute affects both.
+- Remove one output and add it back; confirm the other keeps playing and the
+  last output cannot be removed.
+- Confirm the speaker toggle mutes every selected output.
 - Confirm the mic bus, virtual mic, and per-channel meters are unaffected.
 
 The QML popup is verified manually; there is no QML test harness.
@@ -584,6 +683,8 @@ The QML popup is verified manually; there is no QML test harness.
   work; the latter operate on the first `rnnoise` instance.
 - The old hand-written config is backed up once and replaced by the generated
   config.
+- A missing `devices.outputs` list migrates to `[devices.output]`; `output`
+  remains the first/primary entry.
 - A fresh install uses the manifest defaults; the master switch defaults to
   off, matching the current `DEFAULT_STATE`.
 
@@ -600,6 +701,9 @@ The QML popup is verified manually; there is no QML test harness.
   are installed; otherwise they show an install hint.
 - `wavemix --version`, `fx plugins`, and the popup show core/plugin versions.
 - Incompatible manifests and newer state versions fail safely.
+- Two selected hardware outputs receive the same mix; the per-channel output
+  fader and speaker mute affect both; removing one output keeps the other
+  playing; the last output cannot be removed.
 - Unit tests pass, no Wavemix QML errors are logged, and the mic bus/meters
   continue to work.
 

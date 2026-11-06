@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the hardcoded RNNoise mic filter with a versioned, manifest-driven effect chain that supports add/remove/reorder/bypass, live controls, and native LADSPA/LV2/builtin plugins including GPU denoisers.
+**Goal:** Replace the hardcoded RNNoise mic filter with a versioned, manifest-driven effect chain that supports add/remove/reorder/bypass, live controls, GPU denoisers, and duplicate the output mix across multiple selected hardware outputs.
 
-**Architecture:** A new `bin/wavemix_fx.py` module owns manifests, state migration, chain compilation, config rendering, and live control mapping. `bin/wavemix` exposes `fx` commands and keeps `micfx` as a compatibility adapter. The chain compiles into one generated PipeWire filter-chain config; structural changes restart PipeWire, control changes use `pw-cli set-param` and never interrupt audio. The bar popup becomes an Effects popup driven by `wavemix fx state --json`.
+**Architecture:** A new `bin/wavemix_fx.py` module owns manifests, state migration, chain compilation, config rendering, and live control mapping. `bin/wavemix` exposes `fx` commands and keeps `micfx` as a compatibility adapter. The chain compiles into one generated PipeWire filter-chain config; structural changes restart PipeWire, control changes use `pw-cli set-param` and never interrupt audio. Each channel output send creates one loopback per selected hardware output, sharing the channel fader. The bar popup becomes an Effects popup driven by `wavemix fx state --json`.
 
 **Tech Stack:** Python 3.10+ standard library, PipeWire filter-chain (`libpipewire-module-filter-chain`), `pw-cli`/`pw-dump`/`systemctl`, Quickshell/QML (Omarchy plugin), `unittest`.
 
@@ -20,6 +20,8 @@
 - Never overwrite a newer state version; never install or download anything from a manifest.
 - Bundled manifests install to `~/.local/share/wavemix/plugins`; user manifests live in `~/.config/wavemix/plugins`.
 - Generated config path is `~/.config/pipewire/pipewire.conf.d/90-wavemix-micfx.conf`.
+- The output mix is duplicated to every selected hardware output; one channel output fader controls all copies.
+- At least one output must remain selected; `devices.output` is the first/primary entry of `devices.outputs`.
 - Existing `micfx on|off|toggle|controls|set` commands remain functional.
 - Run tests with `python3 -m unittest discover -s tests -v`.
 - QML changes are verified manually; there is no QML test harness.
@@ -32,6 +34,8 @@
 - Disabled, missing, or bypassed effects must be skipped cleanly, and port/control names with spaces, `%`, `()`, or `:` must remain correctly quoted. Pin this in Task 4.
 - Setting a live control while PipeWire or the chain node is absent must store the value, report `applied: false`, and apply it after the next restart. Pin this in Task 5.
 - GPU manifests (Maxine/DeepFilterNet) must show an install hint and stay un-addable when their `.so` is missing, without hiding the rest of the plugin list. Pin this in Task 2.
+- A vanished output, or removing the last selected output, must leave at least one hardware output and must not silently drop the mix. Pin this in Tasks 8 and 9.
+- Mixed output mute states must produce the documented all-muted/toggle-all behavior. Pin this in Task 9.
 
 ---
 
@@ -284,7 +288,7 @@ git commit -m "feat: add versioned effect manifest discovery" -m "Validate bundl
 
 **Files:**
 - Modify: `bin/wavemix_fx.py`
-- Modify: `bin/wavemix:227-240` (`load_state`)
+- Modify: `bin/wavemix:50-70` (`DEFAULT_STATE`), `bin/wavemix:227-240` (`load_state`)
 - Modify: `tests/test_wavemix.py`
 
 **Interfaces:**
@@ -326,6 +330,19 @@ class StateTests(unittest.TestCase):
   def test_newer_state_version_is_rejected(self):
     with self.assertRaises(wavemix_fx.FxError):
       wavemix_fx.migrate_state({"version": 3}, manifests, "1.1.0")
+
+  def test_missing_outputs_migrates_to_primary(self):
+    state = {"version": 1, "devices": {"output": "alsa_out", "input": "alsa_in"},
+             "micFx": {"enabled": False}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual(migrated["devices"]["outputs"], ["alsa_out"])
+
+  def test_existing_outputs_are_preserved(self):
+    state = {"version": 2, "devices": {"output": "a", "outputs": ["a", "b"],
+             "input": "in"}, "micFx": {"enabled": False, "chain": []}}
+    migrated = wavemix_fx.migrate_state(state, manifests, "1.1.0")
+    self.assertEqual(migrated["devices"]["outputs"], ["a", "b"])
+    self.assertEqual(migrated["devices"]["output"], "a")
 
   def test_add_remove_move_toggle_and_instance_ids(self):
     state = {"version": 2, "micFx": {"enabled": True, "chain": []}}
@@ -375,6 +392,9 @@ Rules:
   - v1 with `micFx.controls` creates `rnnoise-1` using only keys valid in the RNNoise manifest, then fills missing keys with defaults
   - v1 without controls uses `default_chain`
   - always sets `version: 2` and ensures `micFx.enabled` exists
+  - ensures `devices.outputs` is a non-empty list; if missing/empty, sets it
+    to `[devices.output]`; if `devices.output` is missing from a non-empty
+    list, moves the first entry into `devices.output`
   - preserves unknown fields
 - `add_instance` rejects unknown/unavailable/error manifests; enforces `allowMultiple`; generates the lowest unused `<plugin>-<n>`; appends or inserts at `index`.
 - `remove_instance`, `move_instance`, `toggle_instance` mutate the chain and return success.
@@ -762,7 +782,236 @@ git commit -m "feat: install effect plugins and generated config" -m "Ship wavem
 
 ---
 
-### Task 8: Effects popup data plumbing and master switch
+### Task 8: Multi-output graph engine
+
+**Files:**
+- Modify: `bin/wavemix` (`channel_target`, `ensure_send`, `apply_all_sends`, `graph_up`, `status`, `sanitize_devices`, `device_mute`)
+- Modify: `tests/test_wavemix.py`
+
+**Interfaces:**
+- Consumes: `devices.outputs`, `devices.output`, existing `sink_inputs()` and `sink_name_by_index()`.
+- Produces:
+  - `channel_targets(channel: dict, send: str, devices: dict) -> list[str]`
+  - `streams_for(channel_id: str, send: str) -> list[dict]`
+  - `ensure_send` creates one loopback per target
+  - `apply_all_sends` applies the shared tag to every copy
+  - `status` sends include `targets` and all-target liveness
+  - `device_mute("output", state)` is true only when every selected output is muted
+
+- [ ] **Step 1: Write the failing graph tests**
+
+Add `MultiOutputGraphTests`:
+
+```python
+class MultiOutputGraphTests(unittest.TestCase):
+  def test_channel_targets_returns_each_selected_output(self):
+    devices = {"output": "a", "outputs": ["a", "b", "c"]}
+    self.assertEqual(wavemix.channel_targets({"source": "apps"}, "output", devices),
+                     ["a", "b", "c"])
+    self.assertEqual(wavemix.channel_targets({"source": "apps"}, "input", devices),
+                     [wavemix.STREAM_BUS])
+
+  def test_channel_targets_dedupes_and_falls_back(self):
+    self.assertEqual(wavemix.channel_targets({}, "output", {"outputs": ["a", "a"]}), ["a"])
+    self.assertEqual(wavemix.channel_targets({}, "output", {"output": "a"}), ["a"])
+
+  def test_ensure_send_creates_one_loopback_per_output(self):
+    # Fake sink_inputs() returning one existing tagged stream for "a".
+    # Expect load_module called once for "b", with sink=b and the same tag.
+    ...
+
+  def test_apply_all_sends_updates_every_copy(self):
+    # Fake sink_inputs() returning two streams tagged "browser:output".
+    # Expect set-sink-input-volume/mute for both indexes.
+    ...
+
+  def test_status_reports_output_targets_and_all_target_liveness(self):
+    # A state with outputs ["a", "b"] and one live stream for each.
+    # status JSON: sends.output.targets == ["a", "b"], live == True.
+    ...
+
+  def test_sanitize_devices_keeps_at_least_one_output(self):
+    # devices.outputs contains a virtual/vanished name plus one hardware name.
+    # The invalid entry is dropped and output is the remaining hardware name.
+    ...
+
+  def test_device_mute_is_true_only_when_all_outputs_are_muted(self):
+    # a muted, b unmuted -> False; both muted -> True.
+    ...
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `python3 -m unittest discover -s tests -v`
+Expected: FAIL with missing `channel_targets`/`streams_for` and old single-output behavior.
+
+- [ ] **Step 3: Implement the multi-output graph**
+
+Rules:
+
+- `channel_targets` returns the deduped `devices.outputs` for the output send,
+  falling back to `[devices.output]` or `@DEFAULT_SINK@`; the input send stays
+  `[STREAM_BUS]`.
+- `streams_for` returns every sink input whose `wavemix` tag is
+  `<channel>:<send>`.
+- `ensure_send` gets the capture once, then for each target checks whether a
+  tagged stream already targets that sink (map sink index to name), and creates
+  only the missing loopbacks. Keep the existing muted creation.
+- `apply_all_sends` maps tag → list of streams and applies the trimmed volume
+  and mute to every stream for the tag.
+- `graph_up` requires a live stream for every target of every channel send.
+- `status` adds `targets` (selected sink names) and `liveTargets`; `live` is
+  true only when all targets have streams. Keep `liveVolume`/`liveMuted` from
+  the first stream for the existing UI.
+- `sanitize_devices` filters `devices.outputs` to hardware names, falls back to
+  the default sink/first hardware, and sets `devices.output` to the first
+  entry. It returns True when anything changed.
+- `device_mute("output", state)` returns True only when every selected output
+  is muted.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `python3 -m unittest discover -s tests -v`
+Expected: PASS for target construction, per-target loopbacks, all-copy
+volume/mute, status liveness, sanitization, and all-output mute semantics.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bin/wavemix tests/test_wavemix.py
+git commit -m "feat: duplicate output sends across selected devices" -m "Build one loopback per selected hardware output, apply the shared send tag to every copy, report per-target liveness, sanitize vanished outputs while keeping at least one, and make the output mute state true only when all selected outputs are muted."
+```
+
+---
+
+### Task 9: Multi-output CLI commands
+
+**Files:**
+- Modify: `bin/wavemix` (`cmd_device`, `cmd_devices`, `cmd_mute`, `cmd_mutes`, parser)
+- Modify: `tests/test_wavemix.py`
+
+**Interfaces:**
+- Consumes: the Task 8 graph and mute helpers.
+- Produces:
+  - `wavemix device output <name>`
+  - `wavemix device output-add <name>`
+  - `wavemix device output-remove <name>`
+  - `devices --json` with `selected.outputs`
+  - all-output `mutes` and `mute output on|off|toggle`
+
+- [ ] **Step 1: Write the failing CLI tests**
+
+Add `MultiOutputCliTests`:
+
+```python
+class MultiOutputCliTests(unittest.TestCase):
+  def test_output_add_appends_and_rebuilds(self):
+    # state outputs ["a"]; main(["device", "output-add", "b"]).
+    # Assert outputs ["a","b"] and a rebuild/up call occurred.
+
+  def test_output_remove_refuses_the_last_output(self):
+    # state outputs ["a"]; main(["device", "output-remove", "a"]).
+    # Assert non-zero exit or SystemExit, state unchanged, outputs still ["a"].
+
+  def test_output_remove_keeps_the_primary(self):
+    # state output "a", outputs ["a","b"]; remove "b".
+    # Assert outputs ["a"], output "a".
+
+  def test_devices_json_includes_selected_outputs(self):
+    # Capture devices --json; assert selected.outputs == ["a","b"].
+
+  def test_mute_toggle_applies_to_every_output(self):
+    # a unmuted, b muted; mute output toggle.
+    # Expect both set to muted.
+
+  def test_mutes_reports_output_true_only_when_all_are_muted(self):
+    # a muted, b unmuted -> {"output": false}; both muted -> true.
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `python3 -m unittest discover -s tests -v`
+Expected: FAIL because the new device actions/JSON are missing.
+
+- [ ] **Step 3: Implement the CLI surface**
+
+Rules:
+
+- Extend the `device` parser to accept `output`, `output-add`,
+  `output-remove`, and `input`.
+- `device output <name>` moves the name to the front of `devices.outputs`,
+  preserves other selections, sets `devices.output`, validates hardware, saves,
+  and rebuilds with `up(state)`.
+- `output-add` appends a non-duplicate hardware device; `output-remove` removes
+  one but rejects removing the last selection.
+- `devices --json` adds `selected.outputs` while keeping
+  `selected.output`.
+- `cmd_mute` for output applies the action to every selected output; `toggle`
+  computes the new state from `device_mute` (all-muted) and applies it to all.
+  Input stays single-device.
+- `cmd_mutes` returns the all-muted output boolean.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `python3 -m unittest discover -s tests -v`
+Expected: PASS for add/remove/last-output/JSON/mute-all tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bin/wavemix tests/test_wavemix.py
+git commit -m "feat(cli): add multi-output device commands" -m "Add output-add/output-remove, preserve the primary when removing, reject removing the last output, expose selected.outputs in devices JSON, and apply mute/toggle to every selected output with all-muted status semantics."
+```
+
+---
+
+### Task 10: Multi-output mixer UI
+
+**Files:**
+- Modify: `plugin/Panel.qml`
+
+**Interfaces:**
+- Consumes: `devices --json` `selected.outputs`, `device output-add/remove`.
+- Produces: an **Also play to** checkbox list, an output-count label on send rows, and all-output speaker mute via the existing CLI.
+
+- [ ] **Step 1: Manual baseline**
+
+Open the mixer and confirm the current single **Output** dropdown and speaker toggle work.
+
+- [ ] **Step 2: Add the additional-output picker**
+
+- Keep the existing `ddOutput` primary dropdown.
+- Add a `PanelSectionHeader` **Also play to** and a checkbox row for each
+  hardware output that is not the primary.
+- Add `deviceSelectedOutputs`, `outputIsSelected(name)`, and
+  `toggleOutput(name)` QML helpers reading `devicesData.selected.outputs`.
+- `toggleOutput` calls `device output-add`/`output-remove`, refreshes devices,
+  and shows a short notice when the last output cannot be removed.
+- Show `out ×N` in the `SendRow` label when `selected.outputs.length > 1`.
+- Keep the speaker toggle and bar icon behavior; the CLI now mutes all selected
+  outputs.
+- Do not change the Default out dropdown or the output fader/meter logic.
+
+- [ ] **Step 3: Verify manually**
+
+- Select two outputs; confirm both receive the mix and the per-channel `out`
+  fader/mute affects both.
+- Add/remove an output; confirm the other keeps playing and the last output
+  cannot be removed.
+- Confirm the speaker icon mutes/unmutes all selected outputs.
+- Confirm the default-sink dropdown and per-channel meters still work.
+- Confirm no QML errors in the journal.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add plugin/Panel.qml
+git commit -m "feat(plugin): add the multi-output mixer picker" -m "Keep the primary Output dropdown, add an Also play to checkbox list for additional hardware outputs, show the selected-output count on out rows, and surface the last-output rejection notice. Speaker mute now covers every selected output through the CLI."
+```
+
+---
+
+### Task 11: Effects popup data plumbing and master switch
 
 **Files:**
 - Modify: `plugin/Panel.qml`
@@ -805,7 +1054,7 @@ git commit -m "feat(plugin): load the effect chain into the popup" -m "Switch th
 
 ---
 
-### Task 9: Effects popup chain editing
+### Task 12: Effects popup chain editing
 
 **Files:**
 - Modify: `plugin/Panel.qml`
@@ -816,7 +1065,7 @@ git commit -m "feat(plugin): load the effect chain into the popup" -m "Switch th
 
 - [ ] **Step 1: Manual baseline**
 
-Open the popup and confirm the read-only chain from Task 8.
+Open the popup and confirm the read-only chain from Task 11.
 
 - [ ] **Step 2: Add chain editing**
 
@@ -843,7 +1092,7 @@ git commit -m "feat(plugin): add effect chain editing" -m "Add the add-effect li
 
 ---
 
-### Task 10: Effects popup settings and version/GPU display
+### Task 13: Effects popup settings and version/GPU display
 
 **Files:**
 - Modify: `plugin/Panel.qml`
@@ -881,7 +1130,7 @@ git commit -m "feat(plugin): add effect settings and version-aware rows" -m "Ren
 
 ---
 
-### Task 11: Documentation, end-to-end verification, and release
+### Task 14: Documentation, end-to-end verification, and release
 
 **Files:**
 - Modify: `README.md`
@@ -894,6 +1143,7 @@ git commit -m "feat(plugin): add effect settings and version-aware rows" -m "Ren
 Document:
 
 - the Effects popup and chain editing
+- the multi-output picker and all-output mute behavior
 - manifest locations and the schema
 - bundled effects and their versions
 - GPU/neural effects: DeepFilterNet and Maxine LADSPA, with the runtime/LADSPA_PATH/quantum caveats
@@ -920,6 +1170,9 @@ Expected: all tests pass, both Python files compile, installer parses.
 - Restart the shell if needed.
 - Confirm `wavemix --version` and the popup version.
 - Add RNNoise, high-pass, and noise gate; reorder, bypass, remove; confirm audio and routing.
+- Select two hardware outputs; confirm both receive the same mix, the per-channel
+  output fader/mute affects both, and the last output cannot be removed.
+- Confirm the speaker toggle mutes every selected output.
 - Change controls live; confirm no restart.
 - Restart PipeWire; confirm the chain and controls persist.
 - If available, add DeepFilterNet and confirm it runs; otherwise confirm the install hint.
@@ -940,8 +1193,8 @@ git tag v1.1.0
 
 ## Self-Review
 
-- **Spec coverage:** Tasks 1–6 cover versioning, manifests, state migration, compilation, live controls, CLI; Task 7 covers installation; Tasks 8–10 cover the popup; Task 11 covers docs and release.
+- **Spec coverage:** Tasks 1–6 cover versioning, manifests, state migration, compilation, live controls, CLI; Task 7 covers installation; Tasks 8–10 cover multi-device output; Tasks 11–13 cover the popup; Task 14 covers docs and release.
 - **Step scan:** Each task has a failing test, a failing run, implementation rules, a passing run, and a commit. QML tasks use explicit manual checks because no QML harness exists.
-- **Type consistency:** `wavemix_fx` names are consistent across tasks (`discover_manifests`, `migrate_state`, `enabled_instances`, `render_config`, `apply_chain_controls`, `state_snapshot`). The CLI keeps `micfx` adapters while the new surface is `fx`.
-- **Review focus coverage:** Task 2 pins incompatible/missing GPU manifests; Task 3 pins v1 migration; Task 4 pins skipping/quoting; Task 5 pins missing-node control behavior; Task 6 pins state JSON/legacy adapters.
+- **Type consistency:** `wavemix_fx` names are consistent across tasks (`discover_manifests`, `migrate_state`, `enabled_instances`, `render_config`, `apply_chain_controls`, `state_snapshot`). Multi-output uses `devices.outputs`, `channel_targets`, `streams_for`, and the existing `channel:output` tag. The CLI keeps `micfx` adapters while the new surface is `fx`.
+- **Review focus coverage:** Task 2 pins incompatible/missing GPU manifests; Task 3 pins v1 migration and `devices.outputs`; Task 4 pins skipping/quoting; Task 5 pins missing-node control behavior; Task 6 pins state JSON/legacy adapters; Tasks 8–9 pin vanished/last-output and mixed-mute behavior.
 - **Proportion:** The plan names decisions and tests; implementation bodies are left to the executor.
