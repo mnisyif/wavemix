@@ -88,6 +88,11 @@ Panel {
   property bool fxApplying: false
   property string fxError: ""
   property string fxLoadError: ""
+  // The add list scrolls when the manifests do not fit. Leave room for the
+  // header, back row, and section header before using the screen height.
+  readonly property real fxAddListMaxHeight: Math.max(Style.space(120),
+    Math.min(Style.space(360),
+             fxPopup.availableCardHeight - Style.space(230)))
 
   // ---- model ---------------------------------------------------------------
   readonly property var channelIds: {
@@ -308,8 +313,10 @@ Panel {
   // ---- commands ------------------------------------------------------------
   property var queue: []
   property string cmdTag: ""
-  property string lastFinishedTag: ""
-  property int lastExitCode: 0
+  // Completed commands are queued so a command that exits while the next one
+  // is being started cannot lose its tag/exit status. `pump()` never clears it;
+  // the runningChanged handler consumes one entry per finished command.
+  property var finishedCommands: []
 
   // run() accepts an optional tag so a queued command can be identified when
   // it exits (the structural fx commands need their own completion handling).
@@ -322,9 +329,9 @@ Panel {
     var next = queue[0]
     queue = queue.slice(1)
     root.cmdTag = String(next.tag || "")
-    root.lastFinishedTag = ""
     cmd.command = [root.bin].concat(next.args)
     cmd.running = true
+    if (root.cmdTag === "fxapply") fxApplyWatchdog.restart()
   }
   function refreshSoon() { settle.restart() }
 
@@ -456,6 +463,7 @@ Panel {
   function openFxAdd() {
     if (!root.fxData || root.fxApplying) return
     root.fxView = "add"
+    fxPluginScroll.contentY = 0
   }
   function closeFxAdd() { root.fxView = "chain" }
   function fxMutate(args) {
@@ -488,6 +496,7 @@ Panel {
     return ""
   }
   function finishFxCommand(exitCode) {
+    fxApplyWatchdog.stop()
     root.fxApplying = false
     if (exitCode !== 0) {
       var detail = root.fxShortError(cmdErr.text)
@@ -630,16 +639,29 @@ Panel {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      // Record which command exited before runningChanged starts the next one.
-      root.lastFinishedTag = root.cmdTag
-      root.lastExitCode = exitCode
+      // Capture the tag at signal time; a later run()/pump() must not be able
+      // to change which command this exit belongs to.
+      root.finishedCommands = root.finishedCommands.concat([
+        { tag: root.cmdTag, code: exitCode }
+      ])
     }
     onRunningChanged: {
       if (running) return
+      // Capture the tag now, before a deferred callback can be preceded by a
+      // new run() that starts another command.
+      var endedTag = root.cmdTag
       Qt.callLater(function() {
-        if (root.lastFinishedTag === "fxapply") {
-          root.finishFxCommand(root.lastExitCode)
-          root.lastFinishedTag = ""
+        var finished = null
+        if (root.finishedCommands.length > 0) {
+          finished = root.finishedCommands[0]
+          root.finishedCommands = root.finishedCommands.slice(1)
+        }
+        if (finished) {
+          if (finished.tag === "fxapply") root.finishFxCommand(finished.code)
+        } else if (endedTag === "fxapply") {
+          // No exit record: the command could not start. Clear the applying
+          // state instead of leaving every control disabled.
+          root.finishFxCommand(-1)
         }
         root.pump()
         // After the queue drains (and nothing else took its place), refresh the
@@ -648,6 +670,13 @@ Panel {
         if (root.fxOpen && !cmd.running) fxRefreshSoon.restart()
       })
     }
+  }
+
+  Timer {
+    id: fxApplyWatchdog
+    interval: 45000
+    repeat: false
+    onTriggered: if (root.fxApplying) root.finishFxCommand(-1)
   }
 
   Timer {
@@ -1362,13 +1391,35 @@ Panel {
           font.pixelSize: Style.font.body
         }
 
-        Repeater {
-          model: root.fxPlugins
+        Item {
+          width: parent.width
+          implicitHeight: fxPluginScroll.height
 
-          FxPluginRow {
-            required property var modelData
-            width: fxColumn.width
-            plugin: modelData
+          Flickable {
+            id: fxPluginScroll
+            width: parent.width
+            height: Math.min(fxPluginList.implicitHeight,
+                             root.fxAddListMaxHeight)
+            contentWidth: width
+            contentHeight: fxPluginList.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+
+            Column {
+              id: fxPluginList
+              width: fxPluginScroll.width
+
+              Repeater {
+                model: root.fxPlugins
+
+                FxPluginRow {
+                  required property var modelData
+                  width: fxPluginList.width
+                  plugin: modelData
+                }
+              }
+            }
           }
         }
       }
@@ -1558,7 +1609,8 @@ Panel {
         Text {
           id: addVersion
           anchors.verticalCenter: parent.verticalCenter
-          text: "v" + pluginRow.pluginVersion
+          text: pluginRow.pluginVersion !== ""
+            ? "v" + pluginRow.pluginVersion : ""
           textFormat: Text.PlainText
           color: Qt.darker(root.foreground, 1.5)
           font.family: root.fontFamily
