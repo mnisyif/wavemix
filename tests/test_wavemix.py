@@ -77,6 +77,26 @@ class ManifestTests(unittest.TestCase):
     self.assertFalse(manifest["available"])
     self.assertIn("9.0.0", manifest["error"])
 
+  def test_unsupported_schema_version_is_unavailable(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      bundled = root / "bundled"
+      bundled.mkdir()
+      (bundled / "future.json").write_text(
+        json.dumps(manifest_data("future", schemaVersion=2)),
+        encoding="utf-8")
+      (bundled / "ok.json").write_text(
+        json.dumps(manifest_data("ok")), encoding="utf-8")
+
+      manifests = wavemix_fx.discover_manifests(
+        bundled, root / "user", "1.1.0")
+
+      self.assertFalse(manifests["future"]["available"])
+      self.assertIn("schemaVersion", manifests["future"]["error"])
+      self.assertIn("2", manifests["future"]["error"])
+      self.assertTrue(manifests["ok"]["available"])
+      self.assertIsNone(manifests["ok"]["error"])
+
   def test_missing_ladspa_file_is_unavailable(self):
     data = {
       "schemaVersion": 1, "id": "missing", "version": "1.0.0",
@@ -143,12 +163,47 @@ class ManifestTests(unittest.TestCase):
       self.assertEqual(manifest["id"], ident)
       self.assertEqual(manifest["schemaVersion"], 1)
       self.assertEqual(manifest["source"], "bundled")
-      self.assertTrue(manifest["available"] or manifest["error"])
+      self.assertTrue(
+        manifest["error"] is None
+        or manifest["error"].startswith("LADSPA plugin not found:"),
+        f"{ident}: {manifest['error']}")
     self.assertTrue(manifests["rnnoise"]["default"])
     self.assertEqual(
       {control["key"] for control in manifests["rnnoise"]["controls"]},
       {"vadThreshold", "vadGrace", "retroactiveGrace", "dryMix"})
     self.assertEqual(manifests["highpass"]["label"], "bq_highpass")
+
+  def test_bundled_control_and_gpu_values_are_pinned(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      manifests = wavemix_fx.discover_manifests(
+        ROOT / "plugins", Path(tmp) / "user", "1.1.0")
+
+    rnnoise = {c["key"]: c for c in manifests["rnnoise"]["controls"]}
+    vad_grace = rnnoise["vadGrace"]
+    self.assertEqual(
+      (vad_grace["min"], vad_grace["max"], vad_grace["step"],
+       vad_grace["unit"]), (0, 1000, 10, " ms"))
+
+    highpass = {c["key"]: c for c in manifests["highpass"]["controls"]}
+    self.assertEqual(
+      (highpass["freq"]["min"], highpass["freq"]["max"],
+       highpass["freq"]["step"], highpass["freq"]["default"],
+       highpass["freq"]["unit"]), (20, 500, 5, 80, " Hz"))
+    self.assertEqual(
+      (highpass["q"]["min"], highpass["q"]["max"], highpass["q"]["step"],
+       highpass["q"]["default"], highpass["q"]["integer"]),
+      (0.1, 5, 0.1, 0.707, False))
+
+    deepfilter = manifests["deepfilternet"]
+    self.assertFalse(deepfilter["gpu"])
+    self.assertEqual(deepfilter["requires"], "Install deepfilternet-ladspa")
+
+    maxine = manifests["maxine-denoise"]
+    self.assertTrue(maxine["gpu"])
+    self.assertEqual(
+      maxine["requires"],
+      "Install broadcast-maxine-ladspa and the NVIDIA Maxine runtime; "
+      "add ~/.local/lib/ladspa to LADSPA_PATH if needed")
 
   def test_missing_maxine_ladspa_is_unavailable_but_listed(self):
     with tempfile.TemporaryDirectory() as tmp, \
