@@ -498,7 +498,4 @@ directory too if you want a clean slate.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-If you redistribute Wavemix or a derivative work, keep the NOTICE and reference
-the repository: https://github.com/mnisyif/wavemix
+MIT. See [LICENSE](LICENSE).
