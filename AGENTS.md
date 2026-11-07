@@ -319,12 +319,3 @@ journalctl --user -f | grep -iE 'Panel.qml|FxWindow.qml|TypeError|ReferenceError
 - Do not change the license. The project is MIT; keep the copyright and
   permission notice.
 - Do not publish, push, tag, or open a pull request without explicit permission.
-
-## Current workflow debt to fix when releasing
-
-- `v1.2.0` has no tag even though `VERSION` and the changelog say 1.2.0. Tag the
-  commit that actually shipped 1.2.0 before tagging 1.3.0.
-- `main` contains unreleased post-1.2.0 work. Add its `Unreleased` changelog
-  entries before the next release.
-- `VERSION` and `WAVEMIX_VERSION` are separate literals. The test catches drift;
-  do not remove that test.
