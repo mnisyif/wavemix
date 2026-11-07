@@ -189,7 +189,7 @@ class ManifestTests(unittest.TestCase):
         ROOT / "plugins", Path(tmp) / "user", "1.1.0")
 
     expected = {"rnnoise", "highpass", "noisegate",
-                "deepfilternet", "maxine-denoise"}
+                "deepfilternet", "maxine-denoise", "lsp-expander"}
     self.assertEqual(set(manifests), expected)
     for ident in expected:
       manifest = manifests[ident]
@@ -237,6 +237,29 @@ class ManifestTests(unittest.TestCase):
       maxine["requires"],
       "Install broadcast-maxine-ladspa and the NVIDIA Maxine runtime; "
       "add ~/.local/lib/ladspa to LADSPA_PATH if needed")
+
+  def test_lsp_expander_is_a_gentle_downward_expander(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      manifests = wavemix_fx.discover_manifests(
+        ROOT / "plugins", Path(tmp) / "user", "1.1.0")
+    expander = manifests["lsp-expander"]
+
+    self.assertEqual(expander["type"], "lv2")
+    self.assertEqual(
+      expander["plugin"],
+      "http://lsp-plug.in/plugins/lv2/expander_mono")
+    # PipeWire addresses LV2 ports by symbol, not by display name.
+    self.assertEqual((expander["input"], expander["output"]), ("in", "out"))
+
+    controls = {c["key"]: c for c in expander["controls"]}
+    self.assertEqual(controls["mode"]["param"], "em")
+    self.assertEqual(controls["mode"]["default"], 0)
+    self.assertLessEqual(controls["ratio"]["default"], 2)
+    self.assertGreaterEqual(controls["knee"]["default"], 0.75)
+    self.assertGreaterEqual(controls["attack"]["default"], 10)
+    self.assertGreaterEqual(controls["release"]["default"], 300)
+    self.assertGreaterEqual(controls["hold"]["default"], 50)
+    self.assertEqual(controls["makeup"]["default"], 1)
 
   def test_missing_maxine_ladspa_is_unavailable_but_listed(self):
     with tempfile.TemporaryDirectory() as tmp, \
@@ -402,8 +425,10 @@ class ChainReplaceTests(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
     cls._user_dir = tempfile.TemporaryDirectory()
-    cls.manifests = wavemix_fx.discover_manifests(
-      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    # Keep availability independent of plugins installed in the real HOME.
+    with patch.dict(os.environ, {"HOME": cls._user_dir.name}):
+      cls.manifests = wavemix_fx.discover_manifests(
+        ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
     cls.manifests["rnnoise"]["available"] = True
     cls.manifests["rnnoise"]["error"] = None
 
@@ -981,6 +1006,7 @@ class CliFxTests(unittest.TestCase):
     env = patch.dict(os.environ, {
       "XDG_CONFIG_HOME": str(self.root / "config"),
       "XDG_DATA_HOME": str(self.root / "data"),
+      "HOME": str(self.root / "home"),
     })
     env.start()
     self.addCleanup(env.stop)

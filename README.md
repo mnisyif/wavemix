@@ -90,13 +90,18 @@ omarchy restart shell
 
 ## Usage
 
-Open the mixer by right-clicking either Wavemix icon in the bar. Inside the
-panel:
+Open the mixer by right-clicking either Wavemix icon in the bar. The panel has
+three tabs: **Mixer**, **Effects**, and **Devices**.
 
 - `j` / `k` move between controls
-- `h` / `l` adjust the focused send fader
-- `Enter` toggle a send or mute, open a device dropdown, or add/remove items
+- `h` / `l` switch tabs when the tab row is selected, or adjust the selected send fader
+- `Enter` toggle a send or mute, open a device dropdown, open the Effects window, or add/remove items
 - `Esc` close
+
+The **Effects** tab shows the master switch, the active chain, the auto-headroom
+trim, and a shortcut to the full **Open effects** window. The **Devices** tab
+holds the primary output, additional outputs, the microphone, and the default
+routing.
 
 The thin bar under each channel name is its live level meter. It reads the
 channel's audio before the send faders, so it reacts to the channel itself, not
@@ -104,13 +109,13 @@ to the send level.
 
 ### Multiple outputs
 
-The **Devices** section has a primary **Output** dropdown and an **Also play
+The **Devices** tab has a primary **Output** dropdown and an **Also play
 to** list. Check any additional hardware outputs there. Wavemix creates one
 loopback per selected output for each channel's `out` send; every copy is fed
 by the same channel fader and mute. There is no per-output volume in this
 release.
 
-When more than one output is selected, the channel's send row shows `out ×N`.
+When more than one output is selected, the channel's send row shows `Output ×N`.
 Unchecking the last selected output is refused with a notice. A vanished or
 virtual device is dropped automatically; if the list would become empty,
 Wavemix falls back to the default hardware sink.
@@ -247,7 +252,7 @@ Required fields are `schemaVersion`, `id`, `version`, `name`, `type`,
 | `type` | `ladspa`, `lv2`, or `builtin` |
 | `plugin` | LADSPA `.so` path or LV2 URI; ignored for builtin. `~` and `$HOME` are expanded |
 | `label` | LADSPA or builtin label; optional for LV2 |
-| `input` / `output` | Mono audio port names, without the node prefix |
+| `input` / `output` | Mono audio port names, without the node prefix. PipeWire addresses LV2 ports by symbol, so LV2 manifests use the symbols (e.g. `in`/`out`), not the display names |
 | `config` | Optional static filter config passed to the node. Values must be finite numbers, strings, booleans, lists, or maps |
 | `gpu` | UI/CLI GPU badge; does not change compilation |
 | `requires` | Install hint shown when the plugin is unavailable |
@@ -255,10 +260,11 @@ Required fields are `schemaVersion`, `id`, `version`, `name`, `type`,
 | `allowMultiple` | Whether more than one instance may be added (default `true`) |
 
 Each control needs a stable `key` and the plugin's `param` name, plus its
-display range (`min`, `max`, `step`, `unit`, `default`). `integer` controls are
-rounded, `raw_float` controls are written as floats, and `scale` converts a
-display value to the raw plugin value (`raw = display / scale`; the RNNoise dry
-mix uses `scale: 100`).
+display range (`min`, `max`, `step`, `unit`, `default`). For LV2, `param` is the
+port symbol as reported by PipeWire (`em`, `al`, `er`, ...), not the display
+name. `integer` controls are rounded, `raw_float` controls are written as
+floats, and `scale` converts a display value to the raw plugin value
+(`raw = display / scale`; the RNNoise dry mix uses `scale: 100`).
 
 Validation is per manifest: an invalid, incompatible, or missing plugin is
 listed as unavailable with an error and never compiled. The rest of the chain
@@ -278,11 +284,18 @@ All bundled manifests are definition version `1.0.0` and require Wavemix
 | `noisegate` | Noise Gate | builtin `noisegate` | no | Open/close thresholds and attack/hold/release |
 | `deepfilternet` | DeepFilterNet | LADSPA | no | Optional; `requires: Install deepfilternet-ladspa` |
 | `maxine-denoise` | NVIDIA Maxine Denoiser | LADSPA (GPU) | no | Optional; `gpu: true`, with an install/runtime hint |
+| `lsp-expander` | LSP Expander | LV2 | no | Gentle downward expander; `requires: Install lsp-plugins-lv2` |
 
 When the RNNoise LADSPA plugin is available, a new state starts with RNNoise
 in the chain. If it is not available, the default chain is empty until you add
-an available effect. High-pass, noise gate, DeepFilterNet, and Maxine are added
-from the window or `wavemix fx add`.
+an available effect. High-pass, noise gate, DeepFilterNet, Maxine, and the LSP
+Expander are added from the window or `wavemix fx add`.
+
+The LSP Expander uses the LV2 bundle from `lsp-plugins-lv2`. PipeWire finds
+bundles in `~/.lv2`, `/usr/local/lib/lv2`, and `/usr/lib/lv2`. Its defaults are
+deliberately conservative: downward mode, a low threshold, a 1.6:1 ratio, a
+wide knee, a 20 ms attack, a 400 ms release, and 100 ms hold. Raise the
+threshold or ratio in the Effects window to make it act more aggressively.
 
 ### GPU and neural effects
 
