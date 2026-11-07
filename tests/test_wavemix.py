@@ -902,12 +902,12 @@ class CliFxTests(unittest.TestCase):
     discover.start()
     self.addCleanup(discover.stop)
 
-  def write_state(self, enabled=True, chain=None):
+  def write_state(self, enabled=True, chain=None, input="@DEFAULT_SOURCE@"):
     data = {
       "version": 2,
       "devices": {"output": "@DEFAULT_SINK@",
                   "outputs": ["@DEFAULT_SINK@"],
-                  "input": "@DEFAULT_SOURCE@"},
+                  "input": input},
       "channels": [], "rules": {}, "defaults": {},
       "micFx": {"enabled": enabled, "chain": chain or []},
     }
@@ -948,7 +948,8 @@ class CliFxTests(unittest.TestCase):
     self.assertIn("wavemix fx enable", text)
 
   def test_fx_enable_links_an_already_loaded_chain_without_restart(self):
-    self.write_state(enabled=False, chain=[self.rnnoise_instance()])
+    self.write_state(enabled=False, chain=[self.rnnoise_instance()],
+                     input="alsa_in")
     restart = Mock(return_value=True)
     with patch.object(wavemix, "restart_audio", restart), \
          patch.object(wavemix, "sanitize_devices", Mock(return_value=False)), \
@@ -958,13 +959,15 @@ class CliFxTests(unittest.TestCase):
          patch.object(wavemix, "ensure_mic_bus_feed") as feed, \
          patch.object(wavemix, "set_mic_fx_link") as link, \
          patch.object(wavemix, "set_mic_fx_playback_link") as playback, \
+         patch.object(wavemix, "raw_mic_outputs",
+                      return_value=["alsa_in:capture_MONO"]), \
          patch.object(wavemix, "apply_all_sends"), \
          patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
          patch.object(wavemix.fx, "apply_chain_controls"), \
          contextlib.redirect_stdout(io.StringIO()):
       self.assertEqual(wavemix.main(["fx", "enable"]), 0)
 
-    link.assert_called_once_with("@DEFAULT_SOURCE@", True)
+    link.assert_called_once_with("alsa_in", True)
     playback.assert_called_once_with()
     feed.assert_not_called()
     restart.assert_not_called()
@@ -1117,6 +1120,7 @@ class UpReapplyTests(unittest.TestCase):
         ensure_defaults=Mock(),
         set_mic_fx_link=Mock(),
         set_mic_fx_playback_link=Mock(),
+        ensure_mic_bus_feed=Mock(),
         apply_all_sends=Mock()), \
         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
         patch.object(wavemix.fx, "discover_manifests",
@@ -1155,6 +1159,7 @@ class UpReapplyTests(unittest.TestCase):
         ensure_defaults=Mock(),
         set_mic_fx_link=Mock(side_effect=link),
         set_mic_fx_playback_link=Mock(),
+        ensure_mic_bus_feed=Mock(),
         apply_all_sends=Mock()), \
         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
         patch.object(wavemix.fx, "discover_manifests",
@@ -1188,13 +1193,16 @@ class MicFxRoutingTests(unittest.TestCase):
     return [{"id": "highpass-1", "plugin": "highpass", "enabled": enabled,
              "controls": {}}]
 
-  def run_up(self, state, manifests, capture=34):
+  def run_up(self, state, manifests, capture=34,
+             raw_outputs=("alsa_in:capture_MONO",)):
     names = ("sanitize_devices", "unload_all", "ensure_buses",
              "ensure_defaults", "set_mic_fx_link",
              "set_mic_fx_playback_link", "ensure_mic_bus_feed",
-             "ensure_channel_sink", "ensure_send", "apply_all_sends")
+             "ensure_channel_sink", "ensure_send", "apply_all_sends",
+             "raw_mic_outputs")
     mocks = {name: Mock() for name in names}
     mocks["sanitize_devices"].return_value = False
+    mocks["raw_mic_outputs"].return_value = list(raw_outputs)
     with patch.multiple(wavemix, **mocks), \
         patch.object(wavemix.fx, "find_capture_node_id",
                      return_value=capture), \
@@ -1205,12 +1213,12 @@ class MicFxRoutingTests(unittest.TestCase):
       wavemix.up(state)
     return mocks
 
-  def assert_raw_path(self, mocks):
-    mocks["set_mic_fx_link"].assert_called_once_with("alsa_in", False)
-    mocks["ensure_mic_bus_feed"].assert_called_once_with("alsa_in")
+  def assert_raw_path(self, mocks, mic="alsa_in"):
+    mocks["set_mic_fx_link"].assert_called_once_with(mic, False)
+    mocks["ensure_mic_bus_feed"].assert_called_once_with(mic)
     mocks["set_mic_fx_playback_link"].assert_not_called()
     for call in mocks["ensure_send"].call_args_list:
-      self.assertEqual(call.args[3], "alsa_in")
+      self.assertEqual(call.args[3], mic)
 
   def test_master_on_empty_chain_uses_raw_mic(self):
     mocks = self.run_up(self.state([]), self.manifests())
@@ -1243,6 +1251,17 @@ class MicFxRoutingTests(unittest.TestCase):
     mocks["ensure_mic_bus_feed"].assert_not_called()
     for call in mocks["ensure_send"].call_args_list:
       self.assertEqual(call.args[3], wavemix.MIC_BUS + ".monitor")
+
+  def test_master_on_chain_with_default_source_sentinel_uses_raw_mic(self):
+    # A chain is loaded and live, but the saved input is still the unresolved
+    # @DEFAULT_SOURCE@ sentinel (no concrete hardware port). Routing through FX
+    # can never link it, so up() must fall back to the raw feed.
+    state = self.state(self.chain())
+    state["devices"]["input"] = "@DEFAULT_SOURCE@"
+    mocks = self.run_up(state, self.manifests(), raw_outputs=())
+
+    self.assert_raw_path(mocks, mic="@DEFAULT_SOURCE@")
+    mocks["raw_mic_outputs"].assert_called_once_with("@DEFAULT_SOURCE@")
 
   def test_up_render_error_leaves_the_existing_graph_intact(self):
     state = self.state(self.chain())
@@ -1373,8 +1392,49 @@ class MultiOutputGraphTests(unittest.TestCase):
            patch.object(wavemix, "_fx_manifests", return_value=manifests), \
            patch.object(wavemix.fx, "find_capture_node_id",
                         return_value=34), \
+           patch.object(wavemix, "raw_mic_outputs",
+                        return_value=["mic:capture_MONO"]), \
            patch.object(wavemix, "fx_links_present", return_value=links):
         self.assertIs(wavemix.graph_up(state), expected)
+
+  def test_graph_up_default_source_sentinel_stays_stable_on_the_raw_feed(self):
+    # Regression: with an unresolved @DEFAULT_SOURCE@ device and a loaded chain,
+    # FX links can never exist, so graph_up() must treat the chain as inactive
+    # and accept the raw mic-bus feed instead of asking the watcher to rebuild
+    # the whole graph every two seconds.
+    state = {"devices": {"output": "a", "outputs": ["a"],
+                         "input": "@DEFAULT_SOURCE@"},
+             "channels": [],
+             "micFx": {"enabled": True, "chain": [{
+               "id": "highpass-1", "plugin": "highpass",
+               "enabled": True, "controls": {},
+             }]}}
+    manifests = {"highpass": {"available": True, "error": None}}
+    feed = self.stream(1, wavemix.MICBUS_TAG, 99)
+    links = Mock(return_value=False)
+    with patch.object(wavemix, "existing_source_names",
+                      return_value={wavemix.MIC_BUS_SOURCE,
+                                    wavemix.STREAM_BUS_SOURCE}), \
+         patch.object(wavemix, "existing_sink_names", return_value=set()), \
+         patch.object(wavemix, "sink_inputs", return_value=[feed]), \
+         patch.object(wavemix, "_fx_manifests", return_value=manifests), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=34), \
+         patch.object(wavemix, "raw_mic_outputs", return_value=[]), \
+         patch.object(wavemix, "fx_links_present", links):
+      for _ in range(3):
+        self.assertTrue(wavemix.graph_up(state))
+    links.assert_not_called()
+
+  def test_raw_mic_outputs_skips_sentinels_and_matches_concrete_ports(self):
+    with patch.object(wavemix, "sh") as sh:
+      self.assertEqual(wavemix.raw_mic_outputs("@DEFAULT_SOURCE@"), [])
+    sh.assert_not_called()
+
+    ports = "alsa_in:capture_MONO\nalsa_in:capture_FR\nother:output\n"
+    with patch.object(wavemix, "sh", return_value=ports):
+      self.assertEqual(wavemix.raw_mic_outputs("alsa_in"),
+                       ["alsa_in:capture_MONO", "alsa_in:capture_FR"])
+      self.assertEqual(wavemix.raw_mic_outputs("missing"), [])
 
   def test_fx_links_present_checks_capture_and_playback(self):
     text = (

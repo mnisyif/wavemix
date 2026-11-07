@@ -401,6 +401,18 @@ def _pw_ports(flag: str) -> list[str]:
           if line.strip()]
 
 
+def raw_mic_outputs(mic: str) -> list[str]:
+  """Concrete output ports for the selected hardware mic.
+
+  `@DEFAULT_SOURCE@` is a PipeWire alias that only streams resolve; it is not a
+  port prefix, so `pw-link` can never wire it. An empty result also covers a
+  selected mic that has vanished. Callers treat either case as "the FX chain
+  cannot be fed" and keep the raw mic-bus feed."""
+  if not mic or mic.startswith("@"):
+    return []
+  return [port for port in _pw_ports("-o") if port.startswith(mic + ":")]
+
+
 def fx_links_present(raw_mic: str) -> bool:
   """Whether the loaded chain is fed by the mic and feeds every mic-bus input."""
   pairs = _pw_link_pairs()
@@ -629,7 +641,10 @@ def up(state: dict) -> None:
   ensure_defaults(state)
   raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
   capture_id = fx.find_capture_node_id(sh)
-  if fx_chain_active(state, manifests, capture_id):
+  # A sentinel or vanished input has no output port to feed the chain, so the
+  # chain cannot carry audio: fall back to the raw feed instead of wiring a
+  # link that can never exist and rebuilding forever.
+  if fx_chain_active(state, manifests, capture_id) and raw_mic_outputs(raw_mic):
     # The filter-chain feeds the mic bus; wire the mic into the chain explicitly.
     mic = mic_source(state)
     set_mic_fx_link(raw_mic, True)
@@ -680,7 +695,7 @@ def graph_up(state: dict) -> bool:
   inputs = sink_inputs()
   raw_mic = str(state["devices"].get("input") or "@DEFAULT_SOURCE@")
   manifests = _fx_manifests() if mic_fx_enabled(state) else {}
-  active = fx_chain_active(state, manifests)
+  active = fx_chain_active(state, manifests) and bool(raw_mic_outputs(raw_mic))
   if active:
     # The chain must actually bridge the mic into every mic-bus input.
     if not fx_links_present(raw_mic):
