@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-WAVEMIX_VERSION = "1.1.0"
+WAVEMIX_VERSION = "1.2.0"
 MANIFEST_SCHEMA_VERSION = 1
 STATE_VERSION = 2
 

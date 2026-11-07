@@ -61,7 +61,7 @@ class ManifestTests(unittest.TestCase):
     }
     manifest = wavemix_fx.normalize_manifest(
       data, source="bundled", path=Path("/tmp/demo.json"),
-      version="1.1.0")
+      version=wavemix_fx.WAVEMIX_VERSION)
     self.assertTrue(manifest["available"])
     self.assertIsNone(manifest["error"])
     self.assertEqual(manifest["allowMultiple"], True)
@@ -91,7 +91,7 @@ class ManifestTests(unittest.TestCase):
         json.dumps(manifest_data("ok")), encoding="utf-8")
 
       manifests = wavemix_fx.discover_manifests(
-        bundled, root / "user", "1.1.0")
+        bundled, root / "user", wavemix_fx.WAVEMIX_VERSION)
 
       self.assertFalse(manifests["future"]["available"])
       self.assertIn("schemaVersion", manifests["future"]["error"])
@@ -164,7 +164,8 @@ class ManifestTests(unittest.TestCase):
       broken = manifest_data("broken", "1.0.0", config={"x": None})
       (user / "broken.json").write_text(json.dumps(broken), encoding="utf-8")
 
-      manifests = wavemix_fx.discover_manifests(bundled, user, "1.1.0")
+      manifests = wavemix_fx.discover_manifests(
+        bundled, user, wavemix_fx.WAVEMIX_VERSION)
 
       self.assertTrue(manifests["demo"]["available"])
       self.assertIsNone(manifests["demo"]["error"])
@@ -569,12 +570,14 @@ class CompilerTests(unittest.TestCase):
   def test_quotes_and_backslashes_are_escaped(self):
     manifest = wavemix_fx.normalize_manifest(
       manifest_data("demo", label='bad"label\\path'),
-      source="user", path=Path("/tmp/demo.json"), version="1.1.0")
+      source="user", path=Path("/tmp/demo.json"),
+      version=wavemix_fx.WAVEMIX_VERSION)
     state = {"version": 2, "micFx": {"enabled": True, "chain": [
       {"id": "demo-1", "plugin": "demo", "enabled": True,
        "controls": {}}]}}
 
-    text = wavemix_fx.render_config(state, {"demo": manifest}, "1.1.0")
+    text = wavemix_fx.render_config(
+      state, {"demo": manifest}, wavemix_fx.WAVEMIX_VERSION)
 
     self.assertIn('label = "bad\\"label\\\\path"', text)
     self.assertNotIn('bad"label', text)

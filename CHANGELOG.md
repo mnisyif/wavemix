@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.2.0] - 2026-11-07
+
+### Added
+
+- A floating **Effects** window (`mnisyif.wavemix-fx`) opened by middle-clicking
+  either bar icon or the gear on the Noise suppression row. It shows the chain
+  in processing order with a two-column editor, drag-to-reorder rows, add,
+  remove, bypass, and per-effect live controls.
+- Staged structural editing: add, remove, reorder, and bypass are held in the
+  window until **Apply changes**. The window shows unsaved/conflict states and
+  asks before discarding on close.
+- `wavemix fx commit --stdin [--json]`: validates and replaces the whole chain,
+  writes `state.json`, renders once, and restarts audio once. The window uses it
+  for Apply.
+- `fx plugins --json` and `fx state --json` now expose plugin type and control
+  defaults so new effects can be edited before they are applied.
+- The chain model reserves `host`/`format` metadata for the planned external
+  host backend.
+
+### Changed
+
+- The old Effects popup is removed; the bar's mixer panel keeps the master
+  Noise suppression toggle and gear.
+- The bar command queue is simplified now that effect editing lives in the
+  window.
+- The floating window is a separate panel plugin, so a plugin reload cannot
+  take the mixer with it.
+
+### Compatibility
+
+- `state.json` stays version 2 and existing `micFx.chain` values are unchanged.
+- GPU plugins remain ordinary manifests with `gpu: true`; no GPU-specific code
+  path was added.
+- VST3/CLAP hosting via the planned Carla + OSC backend is not part of 1.2.0.
+
 ## [1.1.0] - 2026-11-07
 
 ### Added
