@@ -680,7 +680,13 @@ def replace_chain(state: dict, manifests: dict[str, dict],
         spec = specs.get(key)
         if spec is None:
           raise FxError(f"no such control '{key}' for {plugin_id}")
-        controls[key] = _clamp_display(spec, value)
+        try:
+          number = float(value)
+        except (TypeError, ValueError):
+          raise FxError(f"invalid value for control '{key}'") from None
+        if not math.isfinite(number):
+          raise FxError(f"invalid value for control '{key}'")
+        controls[key] = _clamp_display(spec, number)
 
     new_chain.append(item)
 

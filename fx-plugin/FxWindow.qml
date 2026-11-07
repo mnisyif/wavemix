@@ -25,6 +25,8 @@ Item {
   property string errorText: ""
   property string applyError: ""
   property bool applying: false
+  property bool pendingApply: false
+  property bool awaitingSync: false
   property bool restartWarning: false
   property bool conflict: false
   property bool confirmClose: false
@@ -201,6 +203,7 @@ Item {
     root.draft = next
     root.draftBaseSignature = root.signature(next)
     root.conflict = false
+    root.awaitingSync = false
     root.clampSelection()
   }
 
@@ -310,7 +313,19 @@ Item {
     return copy
   }
 
+  function openAddView() {
+    if (root.applying || root.awaitingSync) return
+    root.addOpen = true
+    root.selectedAddIndex = 0
+    for (var i = 0; i < root.plugins.length; i++)
+      if (root.canAddPlugin(root.plugins[i])) {
+        root.selectedAddIndex = i
+        break
+      }
+  }
+
   function addDraft(pluginId) {
+    if (root.applying || root.awaitingSync) return
     var meta = root.pluginMeta(pluginId)
     if (!root.canAddPlugin(meta)) return
     var controls = {}
@@ -342,6 +357,7 @@ Item {
   }
 
   function removeDraft(key) {
+    if (root.applying || root.awaitingSync) return
     var next = []
     for (var i = 0; i < root.draft.length; i++)
       if (root.draft[i].key !== key) next.push(root.draft[i])
@@ -350,6 +366,7 @@ Item {
   }
 
   function toggleDraft(key) {
+    if (root.applying || root.awaitingSync) return
     var next = root.draft.slice()
     for (var i = 0; i < next.length; i++) {
       if (next[i].key !== key) continue
@@ -360,6 +377,7 @@ Item {
   }
 
   function moveDraft(from, to) {
+    if (root.applying || root.awaitingSync) return
     if (from < 0 || from >= root.draft.length) return
     to = Math.max(0, Math.min(root.draft.length - 1, to))
     if (to === from) return
@@ -386,6 +404,7 @@ Item {
   }
 
   function adjustSelectedControl(delta) {
+    if (root.applying || root.awaitingSync || root.pendingApply) return
     var entry = root.selectedDraftEntry
     var controls = root.controlList(entry)
     if (controls.length === 0) return
@@ -398,6 +417,7 @@ Item {
   }
 
   function startDrag(key, index, y) {
+    if (root.applying || root.awaitingSync) return
     root.dragActive = true
     root.dragFrom = index
     root.dragTarget = index
@@ -446,7 +466,20 @@ Item {
   }
 
   function applyDraft() {
-    if (!root.dirty || root.applying) return
+    if (!root.dirty || root.applying || root.awaitingSync
+        || commitProc.running) return
+    root.applying = true
+    root.applyError = ""
+    root.restartWarning = false
+    if (cmd.running || queue.length > 0) {
+      root.pendingApply = true
+      return
+    }
+    root.startCommit()
+  }
+
+  function startCommit() {
+    if (!root.dirty) return
     var chain = []
     for (var i = 0; i < root.draft.length; i++) {
       var entry = root.draft[i]
@@ -459,13 +492,17 @@ Item {
       }
       chain.push(row)
     }
-    root.applying = true
-    root.applyError = ""
-    root.restartWarning = false
     applyWatchdog.restart()
     commitProc.command = [root.bin, "fx", "commit", "--stdin", "--json"]
     commitProc.running = true
     commitProc.write(JSON.stringify({ chain: chain }) + "\n")
+  }
+
+  function maybeStartPendingApply() {
+    if (!root.pendingApply) return
+    if (cmd.running || queue.length > 0 || commitProc.running) return
+    root.pendingApply = false
+    root.startCommit()
   }
 
   function retryRestart() {
@@ -525,6 +562,7 @@ Item {
   }
 
   function setControl(key, controlKey, value, control) {
+    if (root.applying || root.awaitingSync || root.pendingApply) return
     var entry = null
     for (var i = 0; i < root.draft.length; i++)
       if (root.draft[i].key === key) { entry = root.draft[i]; break }
@@ -641,6 +679,14 @@ Item {
         Qt.callLater(root.refreshState)
       }
     }
+    onRunningChanged: if (!running) {
+      if (root.serverState === null && root.loadError === "")
+        root.loadError = "Could not load effects."
+      if (root.stateRefreshPending) {
+        root.stateRefreshPending = false
+        Qt.callLater(root.refreshState)
+      }
+    }
   }
 
   Process {
@@ -662,7 +708,18 @@ Item {
         if (root.cmdTag === "fx apply") root.restartWarning = false
       }
       root.pump()
-      if (!cmd.running) root.refreshState()
+      if (!cmd.running) {
+        if (root.pendingApply) root.maybeStartPendingApply()
+        else root.refreshState()
+      }
+    }
+    onRunningChanged: {
+      if (running) return
+      root.pump()
+      if (!cmd.running) {
+        if (root.pendingApply) root.maybeStartPendingApply()
+        else if (!root.applying) root.refreshState()
+      }
     }
   }
 
@@ -679,19 +736,30 @@ Item {
     }
     onExited: function(exitCode) {
       root.applying = false
+      root.pendingApply = false
       applyWatchdog.stop()
       var result = null
       try { result = JSON.parse(commitOut.text) } catch (e) {}
       if (exitCode === 0 && result && result.ok === true) {
         root.applyError = ""
         root.forceSyncDraft = true
+        root.awaitingSync = true
+        root.draftBaseSignature = root.signature(root.draft)
         root.restartWarning = result.restarted !== true
         root.refreshState()
       } else {
+        root.awaitingSync = false
         root.applyError = result && result.error
           ? String(result.error)
           : (root.shortError(commitErr.text) || "Could not apply changes.")
       }
+    }
+    onRunningChanged: if (!running && root.applying) {
+      root.applying = false
+      root.pendingApply = false
+      applyWatchdog.stop()
+      root.awaitingSync = false
+      root.applyError = "Could not run the apply command."
     }
   }
 
@@ -721,12 +789,14 @@ Item {
 
   Timer {
     id: applyWatchdog
-    interval: 30000
+    interval: 120000
     repeat: false
     onTriggered: {
       if (root.applying) {
         root.applying = false
+        root.pendingApply = false
         root.applyError = "Applying the chain timed out."
+        if (commitProc.running) commitProc.signal(15)
       }
     }
   }
@@ -820,8 +890,7 @@ Item {
           if (root.selectedKey !== "") root.removeDraft(root.selectedKey)
           event.accepted = true
         } else if (event.key === Qt.Key_A) {
-          root.addOpen = true
-          root.selectedAddIndex = 0
+          root.openAddView()
           event.accepted = true
         } else if (event.key === Qt.Key_H) {
           root.adjustSelectedControl(-1)
@@ -900,6 +969,7 @@ Item {
           ToggleSwitch {
             checked: root.fxEnabled
             enabled: root.serverState !== null && !root.applying
+              && !root.awaitingSync
             foreground: Color.foreground
             onToggled: root.toggleMaster()
           }
@@ -951,6 +1021,25 @@ Item {
 
               Text {
                 width: parent.width
+                visible: root.loadError !== ""
+                text: "Retry"
+                color: loadRetryArea.containsMouse ? Color.foreground
+                                                   : Qt.darker(Color.foreground, 1.3)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+
+                MouseArea {
+                  id: loadRetryArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.refreshState()
+                }
+              }
+
+              Text {
+                width: parent.width
                 visible: root.serverState !== null && root.draft.length === 0
                 text: "No effects. Add one."
                 color: Qt.darker(Color.foreground, 1.4)
@@ -969,6 +1058,34 @@ Item {
                   entry: modelData
                   position: index
                   dragHost: chainColumn
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: addEffectLabel.implicitHeight + Style.space(10)
+
+                Text {
+                  id: addEffectLabel
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "+  Add effect"
+                  color: (!root.applying && !root.awaitingSync)
+                    ? (addEffectArea.containsMouse ? Color.foreground
+                                                   : Qt.darker(Color.foreground, 1.3))
+                    : Qt.darker(Color.foreground, 1.8)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: addEffectArea
+                  anchors.fill: parent
+                  enabled: !root.applying && !root.awaitingSync
+                  hoverEnabled: true
+                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.openAddView()
                 }
               }
             }
@@ -1176,8 +1293,9 @@ Item {
 
           Text {
             text: root.applying ? "Applying… audio restarts briefly"
+              : root.awaitingSync ? "Refreshing effects…"
               : (root.dirty ? "Unsaved changes" : "All changes applied")
-            color: root.applying ? Color.accent
+            color: (root.applying || root.awaitingSync) ? Color.accent
               : (root.dirty ? Color.foreground : Qt.darker(Color.foreground, 1.5))
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
@@ -1186,7 +1304,7 @@ Item {
           Item { Layout.fillWidth: true }
 
           Text {
-            visible: root.dirty && !root.applying
+            visible: root.dirty && !root.applying && !root.awaitingSync
             text: "Discard"
             color: discardArea.containsMouse ? Color.foreground
                                              : Qt.darker(Color.foreground, 1.3)
@@ -1205,7 +1323,7 @@ Item {
 
           Text {
             text: "Apply changes"
-            color: (root.dirty && !root.applying)
+            color: (root.dirty && !root.applying && !root.awaitingSync)
               ? Color.foreground : Qt.darker(Color.foreground, 1.8)
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -1213,7 +1331,8 @@ Item {
             MouseArea {
               anchors.fill: parent
               anchors.margins: -Style.space(4)
-              enabled: root.dirty && !root.applying
+              enabled: root.dirty && !root.applying && !root.awaitingSync
+                && !commitProc.running
               hoverEnabled: true
               cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
               onClicked: root.applyDraft()
@@ -1359,6 +1478,7 @@ Item {
         MouseArea {
           id: dragArea
           anchors.fill: parent
+          enabled: !root.applying && !root.awaitingSync
           cursorShape: Qt.SizeVerCursor
           preventStealing: true
           onPressed: function(mouse) {
@@ -1418,7 +1538,7 @@ Item {
           : String.fromCodePoint(0xf06e) // nf-fa-eye
         tooltipText: row.entry && row.entry.enabled === false
           ? "Enable effect" : "Bypass effect"
-        enabled: !root.applying
+        enabled: !root.applying && !root.awaitingSync
         foreground: Color.foreground
         fontFamily: Style.font.family
         onClicked: root.toggleDraft(row.key)
@@ -1427,7 +1547,7 @@ Item {
       PanelActionButton {
         iconText: String.fromCodePoint(0xf00d)
         tooltipText: "Remove effect"
-        enabled: !root.applying
+        enabled: !root.applying && !root.awaitingSync
         foreground: Color.foreground
         hoverColor: Color.urgent
         fontFamily: Style.font.family
@@ -1532,7 +1652,7 @@ Item {
 
     MouseArea {
       anchors.fill: parent
-      enabled: pluginRow.canAdd
+      enabled: pluginRow.canAdd && !root.applying && !root.awaitingSync
       hoverEnabled: true
       cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
       onClicked: root.addDraft(pluginRow.plugin.id)
@@ -1552,9 +1672,12 @@ Item {
     readonly property bool active: settings.entry
       ? settings.entry.enabled !== false : false
     readonly property bool editable: root.serverState !== null && !root.applying
+      && !root.awaitingSync
       && settings.available && settings.active
       && (settings.entry === null || settings.entry.isNew
           || settings.serverEntry !== null)
+    readonly property string typeText: settings.meta
+      ? String(settings.meta.type || "") : ""
     readonly property string version: settings.entry
       ? String(settings.entry.pluginVersion
                || (settings.meta ? settings.meta.version : "") || "") : ""
@@ -1595,6 +1718,14 @@ Item {
         font.family: Style.font.family
         font.pixelSize: Style.font.body
         font.bold: true
+      }
+
+      Text {
+        visible: settings.typeText !== ""
+        text: settings.typeText
+        color: Qt.darker(Color.foreground, 1.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
       }
 
       Text {

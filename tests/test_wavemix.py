@@ -466,6 +466,22 @@ class ChainReplaceTests(unittest.TestCase):
       {"instance": "rnnoise-1", "plugin": "rnnoise", "enabled": False}])
     self.assertFalse(chain[0]["enabled"])
 
+  def test_replace_chain_rejects_invalid_control_values(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "", "plugin": "highpass",
+         "controls": {"freq": "loud"}}])
+
+  def test_replace_chain_rejects_disallowed_multiple(self):
+    state = self.state_with_rnnoise()
+    manifests = dict(self.manifests)
+    manifests["highpass"] = dict(manifests["highpass"], allowMultiple=False)
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, manifests, [
+        {"instance": "", "plugin": "highpass"},
+        {"instance": "", "plugin": "highpass"}])
+
 
 class CompilerTests(unittest.TestCase):
   @classmethod
@@ -1248,6 +1264,54 @@ class CliFxTests(unittest.TestCase):
     with patch.object(wavemix.sys, "stdin", stdin), \
          contextlib.redirect_stdout(output):
       code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(output.getvalue())["ok"])
+
+  def test_fx_commit_reloads_state_inside_the_lock(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    old = json.loads(self.state_file.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(old))
+    fresh["devices"]["output"] = "new-output"
+    stdin = io.StringIO(json.dumps({"chain": [
+      {"instance": "rnnoise-1", "plugin": "rnnoise"}]}) + "\n")
+    output = io.StringIO()
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         patch.object(wavemix, "restart_audio", Mock(return_value=True)), \
+         patch.object(wavemix, "load_state", side_effect=[old, fresh]), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    self.assertEqual(code, 0)
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual(saved["devices"]["output"], "new-output")
+
+  def test_fx_set_reloads_state_inside_the_lock(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    old = json.loads(self.state_file.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(old))
+    fresh["devices"]["output"] = "new-output"
+    with patch.object(wavemix, "load_state", side_effect=[old, fresh]), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(io.StringIO()):
+      code = wavemix.main(["fx", "set", "rnnoise-1", "vadThreshold", "60"])
+    self.assertEqual(code, 0)
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual(saved["devices"]["output"], "new-output")
+
+  def test_fx_commit_validation_failure_leaves_state_untouched(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    before = self.state_file.read_text(encoding="utf-8")
+    code, out, restart = self.commit({"chain": [
+      {"instance": "missing-1", "plugin": "rnnoise"}]})
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(out)["ok"])
+    self.assertEqual(self.state_file.read_text(encoding="utf-8"), before)
+    restart.assert_not_called()
+
+  def test_fx_commit_requires_stdin(self):
+    self.write_state(enabled=True, chain=[])
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--json"])
     self.assertNotEqual(code, 0)
     self.assertFalse(json.loads(output.getvalue())["ok"])
 

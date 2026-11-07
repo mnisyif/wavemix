@@ -1122,9 +1122,12 @@ def _cmd_fx_state(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_add(args, state: dict, manifests: dict[str, dict]) -> None:
   plugin_id = _fx_one(args, "add", "a plugin id")
-  instance = fx.add_instance(
-    state, manifests, plugin_id, getattr(args, "index", None))
   with graph_lock():
+    # Reload under the lock so a concurrent commit/set cannot be overwritten
+    # by a state snapshot taken before this process waited.
+    state = load_state()
+    instance = fx.add_instance(
+      state, manifests, plugin_id, getattr(args, "index", None))
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1135,10 +1138,11 @@ def _cmd_fx_add(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_remove(args, state: dict, manifests: dict[str, dict]) -> None:
   instance_id = _fx_one(args, "remove", "an instance id")
-  if fx.find_instance(state, instance_id) is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  fx.remove_instance(state, instance_id)
   with graph_lock():
+    state = load_state()
+    if fx.find_instance(state, instance_id) is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    fx.remove_instance(state, instance_id)
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1150,11 +1154,12 @@ def _cmd_fx_move(args, state: dict, manifests: dict[str, dict]) -> None:
   if len(values) != 2 or values[1] not in ("up", "down"):
     raise fx.FxError("fx move needs <instance-id> up|down")
   instance_id, direction = values
-  if fx.find_instance(state, instance_id) is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  if not fx.move_instance(state, instance_id, direction):
-    raise fx.FxError(f"cannot move {instance_id} {direction}")
   with graph_lock():
+    state = load_state()
+    if fx.find_instance(state, instance_id) is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    if not fx.move_instance(state, instance_id, direction):
+      raise fx.FxError(f"cannot move {instance_id} {direction}")
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1163,10 +1168,11 @@ def _cmd_fx_move(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_toggle(args, state: dict, manifests: dict[str, dict]) -> None:
   instance_id = _fx_one(args, "toggle", "an instance id")
-  if not fx.toggle_instance(state, instance_id):
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  instance = fx.find_instance(state, instance_id)
   with graph_lock():
+    state = load_state()
+    if not fx.toggle_instance(state, instance_id):
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    instance = fx.find_instance(state, instance_id)
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1179,17 +1185,18 @@ def _cmd_fx_set(args, state: dict, manifests: dict[str, dict]) -> None:
   if len(values) != 3:
     raise fx.FxError("fx set needs <instance-id> <control> <value>")
   instance_id, key, value = values
-  instance = fx.find_instance(state, instance_id)
-  if instance is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  manifest = _fx_manifest_for(manifests, instance)
-  if manifest is None:
-    raise fx.FxError(f"no manifest for plugin '{instance.get('plugin')}'")
-  control = _fx_control_for(manifest, key)
-  if control is None:
-    raise fx.FxError(f"no such control '{key}' for {instance_id}")
 
   with graph_lock():
+    state = load_state()
+    instance = fx.find_instance(state, instance_id)
+    if instance is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    manifest = _fx_manifest_for(manifests, instance)
+    if manifest is None:
+      raise fx.FxError(f"no manifest for plugin '{instance.get('plugin')}'")
+    control = _fx_control_for(manifest, key)
+    if control is None:
+      raise fx.FxError(f"no such control '{key}' for {instance_id}")
     result = fx.set_instance_control(state, manifests, instance_id, key, value)
     if result is None:
       raise fx.FxError(f"no such control '{key}' for {instance_id}")
@@ -1218,12 +1225,13 @@ def _cmd_fx_set(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_master(args, state: dict, manifests: dict[str, dict]) -> None:
   enabled = args.action == "enable"
-  micfx = state.setdefault("micFx", {})
-  if not isinstance(micfx, dict):
-    micfx = {}
-    state["micFx"] = micfx
-  micfx["enabled"] = enabled
   with graph_lock():
+    state = load_state()
+    micfx = state.setdefault("micFx", {})
+    if not isinstance(micfx, dict):
+      micfx = {}
+      state["micFx"] = micfx
+    micfx["enabled"] = enabled
     save_state(state)
     _fx_render(state, manifests)
     up(state)
@@ -1232,13 +1240,13 @@ def _cmd_fx_master(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_render(state: dict, manifests: dict[str, dict]) -> None:
   with graph_lock():
-    _fx_render(state, manifests)
+    _fx_render(load_state(), manifests)
   print("wavemix: rendered effect chain")
 
 
 def _cmd_fx_apply(state: dict, manifests: dict[str, dict]) -> None:
   with graph_lock():
-    _fx_render(state, manifests)
+    _fx_render(load_state(), manifests)
     _fx_restart_or_fail()
   print("wavemix: applied effect chain")
 
@@ -1255,9 +1263,12 @@ def _cmd_fx_commit(args, state: dict, manifests: dict[str, dict]) -> int:
         or not isinstance(payload.get("chain"), list):
       raise fx.FxError('fx commit payload must be {"chain": [...]}')
 
-    candidate = copy.deepcopy(state)
-    chain = fx.replace_chain(candidate, manifests, payload["chain"])
     with graph_lock():
+      # Reload inside the lock: a live `fx set` may have saved since this
+      # process started, and the commit must build on the newest state.
+      state = load_state()
+      candidate = copy.deepcopy(state)
+      chain = fx.replace_chain(candidate, manifests, payload["chain"])
       fx.render_to_disk(candidate, manifests, fx.WAVEMIX_VERSION)
       save_state(candidate)
       restarted = restart_audio()
@@ -1284,7 +1295,7 @@ def _cmd_fx_commit(args, state: dict, manifests: dict[str, dict]) -> int:
   return 0
 
 
-def cmd_fx(args) -> None:
+def cmd_fx(args) -> int | None:
   state = load_state()
   manifests = _fx_manifests()
   action = args.action

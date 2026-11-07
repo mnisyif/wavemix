@@ -128,12 +128,13 @@ version and contains:
 - a **Microphone effects** master switch;
 - the chain in processing order, with each instance's name, id, bypass, drag
   handle, and remove button;
-- a GPU badge, type badge, and plugin version for effects that declare them;
-- settings for the selected effect: sliders and value fields written live as
-  you release them;
+- a GPU badge in the chain; the selected effect shows its type, version, and
+  description;
+- settings for the selected effect: sliders with live value labels, written
+  live as you release them;
 - **+ Add effect**, which lists every discovered manifest with its name,
-  description, type, version, source, GPU badge, and install hint. Unavailable
-  plugins stay visible but cannot be added.
+  description, type, GPU badge, and install hint. Unavailable plugins stay
+  visible but cannot be added.
 
 Editing rules:
 

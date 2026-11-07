@@ -399,6 +399,11 @@ Panel {
     run(["micfx", "toggle"])
     refreshSoon()
   }
+  // Kept for the `mnisyif.wavemix micfxset` IPC compatibility hook.
+  function setMicFx(key, value) {
+    run(["micfx", "set", key, String(value)])
+    refreshSoon()
+  }
   function openMicFx() {
     if (root.opened) root.close()
     if (root.bar && root.bar.shell
