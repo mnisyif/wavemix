@@ -19,6 +19,7 @@ Everything here is user-level: no sudo, no config outside ~/.config/wavemix.
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import json
 import os
@@ -1121,9 +1122,12 @@ def _cmd_fx_state(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_add(args, state: dict, manifests: dict[str, dict]) -> None:
   plugin_id = _fx_one(args, "add", "a plugin id")
-  instance = fx.add_instance(
-    state, manifests, plugin_id, getattr(args, "index", None))
   with graph_lock():
+    # Reload under the lock so a concurrent commit/set cannot be overwritten
+    # by a state snapshot taken before this process waited.
+    state = load_state()
+    instance = fx.add_instance(
+      state, manifests, plugin_id, getattr(args, "index", None))
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1134,10 +1138,11 @@ def _cmd_fx_add(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_remove(args, state: dict, manifests: dict[str, dict]) -> None:
   instance_id = _fx_one(args, "remove", "an instance id")
-  if fx.find_instance(state, instance_id) is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  fx.remove_instance(state, instance_id)
   with graph_lock():
+    state = load_state()
+    if fx.find_instance(state, instance_id) is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    fx.remove_instance(state, instance_id)
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1149,11 +1154,12 @@ def _cmd_fx_move(args, state: dict, manifests: dict[str, dict]) -> None:
   if len(values) != 2 or values[1] not in ("up", "down"):
     raise fx.FxError("fx move needs <instance-id> up|down")
   instance_id, direction = values
-  if fx.find_instance(state, instance_id) is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  if not fx.move_instance(state, instance_id, direction):
-    raise fx.FxError(f"cannot move {instance_id} {direction}")
   with graph_lock():
+    state = load_state()
+    if fx.find_instance(state, instance_id) is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    if not fx.move_instance(state, instance_id, direction):
+      raise fx.FxError(f"cannot move {instance_id} {direction}")
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1162,10 +1168,11 @@ def _cmd_fx_move(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_toggle(args, state: dict, manifests: dict[str, dict]) -> None:
   instance_id = _fx_one(args, "toggle", "an instance id")
-  if not fx.toggle_instance(state, instance_id):
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  instance = fx.find_instance(state, instance_id)
   with graph_lock():
+    state = load_state()
+    if not fx.toggle_instance(state, instance_id):
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    instance = fx.find_instance(state, instance_id)
     save_state(state)
     _fx_render(state, manifests)
     _fx_restart_or_fail()
@@ -1178,17 +1185,18 @@ def _cmd_fx_set(args, state: dict, manifests: dict[str, dict]) -> None:
   if len(values) != 3:
     raise fx.FxError("fx set needs <instance-id> <control> <value>")
   instance_id, key, value = values
-  instance = fx.find_instance(state, instance_id)
-  if instance is None:
-    raise fx.FxError(f"no such effect instance: {instance_id}")
-  manifest = _fx_manifest_for(manifests, instance)
-  if manifest is None:
-    raise fx.FxError(f"no manifest for plugin '{instance.get('plugin')}'")
-  control = _fx_control_for(manifest, key)
-  if control is None:
-    raise fx.FxError(f"no such control '{key}' for {instance_id}")
 
   with graph_lock():
+    state = load_state()
+    instance = fx.find_instance(state, instance_id)
+    if instance is None:
+      raise fx.FxError(f"no such effect instance: {instance_id}")
+    manifest = _fx_manifest_for(manifests, instance)
+    if manifest is None:
+      raise fx.FxError(f"no manifest for plugin '{instance.get('plugin')}'")
+    control = _fx_control_for(manifest, key)
+    if control is None:
+      raise fx.FxError(f"no such control '{key}' for {instance_id}")
     result = fx.set_instance_control(state, manifests, instance_id, key, value)
     if result is None:
       raise fx.FxError(f"no such control '{key}' for {instance_id}")
@@ -1217,12 +1225,13 @@ def _cmd_fx_set(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_master(args, state: dict, manifests: dict[str, dict]) -> None:
   enabled = args.action == "enable"
-  micfx = state.setdefault("micFx", {})
-  if not isinstance(micfx, dict):
-    micfx = {}
-    state["micFx"] = micfx
-  micfx["enabled"] = enabled
   with graph_lock():
+    state = load_state()
+    micfx = state.setdefault("micFx", {})
+    if not isinstance(micfx, dict):
+      micfx = {}
+      state["micFx"] = micfx
+    micfx["enabled"] = enabled
     save_state(state)
     _fx_render(state, manifests)
     up(state)
@@ -1231,18 +1240,62 @@ def _cmd_fx_master(args, state: dict, manifests: dict[str, dict]) -> None:
 
 def _cmd_fx_render(state: dict, manifests: dict[str, dict]) -> None:
   with graph_lock():
-    _fx_render(state, manifests)
+    _fx_render(load_state(), manifests)
   print("wavemix: rendered effect chain")
 
 
 def _cmd_fx_apply(state: dict, manifests: dict[str, dict]) -> None:
   with graph_lock():
-    _fx_render(state, manifests)
+    _fx_render(load_state(), manifests)
     _fx_restart_or_fail()
   print("wavemix: applied effect chain")
 
 
-def cmd_fx(args) -> None:
+def _cmd_fx_commit(args, state: dict, manifests: dict[str, dict]) -> int:
+  try:
+    if not getattr(args, "stdin", False):
+      raise fx.FxError("fx commit needs --stdin")
+    try:
+      payload = json.loads(sys.stdin.readline())
+    except (json.JSONDecodeError, TypeError, ValueError):
+      raise fx.FxError("fx commit received invalid JSON") from None
+    if not isinstance(payload, dict) \
+        or not isinstance(payload.get("chain"), list):
+      raise fx.FxError('fx commit payload must be {"chain": [...]}')
+
+    with graph_lock():
+      # Reload inside the lock: a live `fx set` may have saved since this
+      # process started, and the commit must build on the newest state.
+      state = load_state()
+      candidate = copy.deepcopy(state)
+      chain = fx.replace_chain(candidate, manifests, payload["chain"])
+      fx.render_to_disk(candidate, manifests, fx.WAVEMIX_VERSION)
+      save_state(candidate)
+      restarted = restart_audio()
+  except fx.FxError as exc:
+    if getattr(args, "json", False):
+      print(json.dumps({"ok": False, "error": str(exc)}))
+      return 1
+    raise
+
+  result = {
+    "ok": True,
+    "restarted": bool(restarted),
+    "chain": [
+      {"instance": item.get("id"), "plugin": item.get("plugin"),
+       "enabled": bool(item.get("enabled", True))}
+      for item in chain if isinstance(item, dict)
+    ],
+  }
+  if getattr(args, "json", False):
+    print(json.dumps(result))
+  else:
+    print("wavemix: effect chain applied" if restarted
+          else "wavemix: effect chain saved; audio restart failed")
+  return 0
+
+
+def cmd_fx(args) -> int | None:
   state = load_state()
   manifests = _fx_manifests()
   action = args.action
@@ -1266,6 +1319,8 @@ def cmd_fx(args) -> None:
     _cmd_fx_render(state, manifests)
   elif action == "apply":
     _cmd_fx_apply(state, manifests)
+  elif action == "commit":
+    return _cmd_fx_commit(args, state, manifests)
   else:
     raise fx.FxError(f"unknown fx action: {action}")
 
@@ -1542,10 +1597,12 @@ def build_parser() -> argparse.ArgumentParser:
   p = sub.add_parser("fx", help="edit the microphone effect chain")
   p.add_argument("action", choices=[
     "plugins", "state", "add", "remove", "move", "toggle", "set",
-    "enable", "disable", "render", "apply"])
+    "enable", "disable", "render", "apply", "commit"])
   p.add_argument("args", nargs="*",
                  help="action arguments (plugin, instance, control, value)")
   p.add_argument("--index", type=int, help="insert position for `add`")
+  p.add_argument("--stdin", action="store_true",
+                 help="read the chain as one JSON line from stdin")
   p.add_argument("--json", action="store_true")
   p.set_defaults(func=cmd_fx)
 
@@ -1574,11 +1631,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
   args = build_parser().parse_args(argv)
   try:
-    args.func(args)
+    return int(args.func(args) or 0)
   except fx.FxError as exc:
     print(f"wavemix: {exc}", file=sys.stderr)
     return 1
-  return 0
 
 
 if __name__ == "__main__":

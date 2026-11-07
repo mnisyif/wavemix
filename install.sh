@@ -7,16 +7,19 @@ config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 bin_home="${XDG_BIN_HOME:-$HOME/.local/bin}"
 plugin_dir="$config_home/omarchy/plugins/mnisyif.wavemix"
+fx_plugin_dir="$config_home/omarchy/plugins/mnisyif.wavemix-fx"
 service_dir="$config_home/systemd/user"
 bundled_plugins="$data_home/wavemix/plugins"
 config_file="$config_home/pipewire/pipewire.conf.d/90-wavemix-micfx.conf"
 
-install -d "$bin_home" "$plugin_dir" "$service_dir"
+install -d "$bin_home" "$plugin_dir" "$fx_plugin_dir" "$service_dir"
 
 install -m 0755 "$repo/bin/wavemix" "$bin_home/wavemix"
 install -m 0644 "$repo/bin/wavemix_fx.py" "$bin_home/wavemix_fx.py"
 install -m 0644 "$repo/plugin/manifest.json" "$plugin_dir/manifest.json"
 install -m 0644 "$repo/plugin/Panel.qml" "$plugin_dir/Panel.qml"
+install -m 0644 "$repo/fx-plugin/manifest.json" "$fx_plugin_dir/manifest.json"
+install -m 0644 "$repo/fx-plugin/FxWindow.qml" "$fx_plugin_dir/FxWindow.qml"
 install -m 0644 "$repo/systemd/wavemix.service" "$service_dir/wavemix.service"
 
 # Bundled manifests are replaced as a set so a removed plugin really disappears.
@@ -53,6 +56,9 @@ fi
 # A fresh install usually picks this up; a restart is the fallback.
 if command -v omarchy-shell >/dev/null 2>&1; then
   omarchy-shell -q shell rescanPlugins || true
+  if command -v omarchy >/dev/null 2>&1; then
+    omarchy plugin enable mnisyif.wavemix-fx >/dev/null 2>&1 || true
+  fi
 fi
 
 printf '%s\n' \

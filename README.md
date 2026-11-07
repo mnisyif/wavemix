@@ -16,8 +16,8 @@ filter-chain nodes. Add, reorder, bypass, and remove effects, and tune their
 controls live without restarting PipeWire.
 
 The bar shows a microphone and a speaker icon: left-click either to mute it,
-right-click either to open the mixer, middle-click either to open the Effects
-popup.
+right-click either to open the mixer, middle-click either to open the floating
+**Effects** window.
 
 ## Features
 
@@ -27,6 +27,7 @@ popup.
 - Route apps to channels by name, with rules that survive restarts
 - One or more physical outputs, all playing the same mix
 - A manifest-driven microphone effect chain with live controls
+- A floating Effects window with drag reordering, staged Apply, and add/remove/bypass
 - Bundled RNNoise, high-pass, noise-gate, DeepFilterNet, and Maxine manifests
 - Everything is user-level; state lives in `~/.config/wavemix/state.json`
 
@@ -58,6 +59,8 @@ The install script copies:
 | `bin/wavemix_fx.py` | `~/.local/bin/wavemix_fx.py` |
 | `plugin/manifest.json` | `~/.config/omarchy/plugins/mnisyif.wavemix/manifest.json` |
 | `plugin/Panel.qml` | `~/.config/omarchy/plugins/mnisyif.wavemix/Panel.qml` |
+| `fx-plugin/manifest.json` | `~/.config/omarchy/plugins/mnisyif.wavemix-fx/manifest.json` |
+| `fx-plugin/FxWindow.qml` | `~/.config/omarchy/plugins/mnisyif.wavemix-fx/FxWindow.qml` |
 | `plugins/*.json` | `~/.local/share/wavemix/plugins/` |
 | `systemd/wavemix.service` | `~/.config/systemd/user/wavemix.service` |
 
@@ -74,11 +77,14 @@ The installer also:
 - enables and restarts the `wavemix` user service;
 - runs `wavemix fx apply` only when the rendered config changed, which restarts
   PipeWire briefly so the new chain loads;
-- asks the shell to rescan plugins.
+- asks the shell to rescan plugins and enables the `mnisyif.wavemix-fx` panel
+  plugin used by the Effects window.
 
-If the widget still does not appear, restart the shell:
+If the widget or the Effects window still does not appear, enable the panel
+plugin and restart the shell:
 
 ```sh
+omarchy plugin enable mnisyif.wavemix-fx
 omarchy restart shell
 ```
 
@@ -116,37 +122,69 @@ mixed state mutes all selected outputs; toggling from all-muted unmutes them.
 ### Effects
 
 Middle-click either bar icon, or click the gear beside the mixer's **Noise
-suppression** row, to open the **Effects** popup. It shows the Wavemix version
-and contains:
+suppression** row, to open the floating **Effects** window. It shows the Wavemix
+version and contains:
 
 - a **Microphone effects** master switch;
-- the chain in processing order, with each instance's name, id, bypass,
-  move-up/move-down, and remove buttons;
-- a GPU badge and plugin version for effects that declare them;
-- settings sliders for the selected effect, written live as you release them;
+- the chain in processing order, with each instance's name, id, bypass, drag
+  handle, and remove button;
+- a GPU badge in the chain; the selected effect shows its type, version, and
+  description;
+- settings for the selected effect: sliders with live value labels, written
+  live as you release them;
 - **+ Add effect**, which lists every discovered manifest with its name,
-  description, version, source, GPU badge, and install hint. Unavailable
-  plugins stay visible but cannot be added.
+  description, type, GPU badge, and install hint. Unavailable plugins stay
+  visible but cannot be added.
 
-Structural changes (add, remove, move, bypass) regenerate the config and
-restart PipeWire briefly; the popup shows `Applying… audio restarts briefly`.
-A manifest becoming unavailable is picked up on the next
-`fx add/remove/move/toggle` or `fx apply`; there is no automatic file-watcher
-trigger. Control changes and the master switch do not restart PipeWire. A
-bypassed effect keeps its stored controls but is excluded from the compiled
-chain.
+Editing rules:
+
+- Dragging a row reorders the chain. Add, remove, reorder, and bypass are staged
+  in the window; they do not touch `state.json` or audio until you press
+  **Apply changes**.
+- Live control changes on an existing effect apply immediately through
+  `wavemix fx set`, without restarting PipeWire. Controls for a new effect are
+  staged with the rest of the draft.
+- **Apply changes** validates the whole staged chain, writes
+  `~/.config/wavemix/state.json`, regenerates the filter-chain config, and
+  restarts PipeWire once. The window shows `Applying… audio restarts briefly`.
+- **Discard** resets the draft. Closing with unsaved structural changes asks
+  before discarding them.
+- If the audio restart fails after the state was written, the window shows
+  `Saved, but audio did not restart` with **Retry**.
+- The master switch calls `wavemix fx enable`/`disable`, updates the JSON, and
+  links/unlinks the already-loaded chain without a restart.
+
+Keyboard:
+
+- `j` / `k` move the selected effect; `Ctrl+Up` / `Ctrl+Down` move it in the
+  chain.
+- `Enter` toggles the selected effect's staged bypass; `Delete` stages removal.
+- `h` / `l` adjust the focused control; `Tab` / `Shift+Tab` change the focused
+  control.
+- `a` opens the add-effect list; `Enter` adds the selected plugin; `Esc` goes
+  back.
+- `Ctrl+Enter` applies; `Esc` closes with the dirty-change prompt.
+
+Control changes and the master switch do not restart PipeWire. A bypassed
+effect keeps its stored controls but is excluded from the compiled chain.
 
 The chain is compiled whenever it has at least one enabled, available effect,
-even while the master switch is off. Enabling the switch then routes the raw
-mic through the already-loaded chain instead of needing an audio restart. An
-empty, all-bypassed, or all-unavailable chain renders no filter-chain module
-and keeps the raw microphone path. If a structural change was never loaded (for
-example after a failed restart), run `wavemix fx apply`.
+even while the master switch is off. Enabling the switch routes the mic through
+the already-loaded chain instead of needing an audio restart. An empty,
+all-bypassed, or all-unavailable chain renders no filter-chain module and keeps
+the raw microphone path. If a structural change was never loaded (for example
+after a failed restart), run `wavemix fx apply`.
 
 Unavailable effects stay in the chain as an `unavailable` row, and the selected
 effect's settings show the error and install hint; the rest of the chain keeps
 working. An effect whose manifest version changed keeps its stored controls and
 shows a warning in its settings area, not an error row.
+
+**GPU and other plugin formats.** GPU support is metadata, not a separate path:
+NVIDIA Maxine, DeepFilterNet, and any other GPU-backed manifest compile through
+the same chain as RNNoise. VST3 and CLAP cannot run in PipeWire's native
+filter-chain; a future release will host them through a Carla + OSC backend.
+That backend is not part of 1.2.0.
 
 ## Effect manifests
 
@@ -244,7 +282,7 @@ All bundled manifests are definition version `1.0.0` and require Wavemix
 When the RNNoise LADSPA plugin is available, a new state starts with RNNoise
 in the chain. If it is not available, the default chain is empty until you add
 an available effect. High-pass, noise gate, DeepFilterNet, and Maxine are added
-from the popup or `wavemix fx add`.
+from the window or `wavemix fx add`.
 
 ### GPU and neural effects
 
@@ -287,7 +325,7 @@ installing a plugin.
   only that manifest unavailable.
 - `fx add` records the manifest's `version` as the instance's `pluginVersion`.
   If the manifest version later differs, `fx state` sets `versionChanged` and
-  the popup warns that the definition changed. Existing control values are kept
+  the window warns that the definition changed. Existing control values are kept
   by key; new controls use manifest defaults and removed controls are ignored.
 - `state.json` is version 2. A state file newer than the binary supports is
   rejected without being overwritten.
@@ -342,6 +380,7 @@ wavemix fx set <instance-id> <control> <value>
 wavemix fx enable|disable         # master switch
 wavemix fx render                 # write the config; no PipeWire restart
 wavemix fx apply                  # render and restart PipeWire
+wavemix fx commit --stdin [--json] # replace the whole chain; one restart
 ```
 
 Behavior details:
@@ -359,8 +398,20 @@ Behavior details:
   chain is compiled and loaded even while the master is off, so enabling links
   it immediately; if the config was never loaded or a restart failed, use
   `fx apply`.
+- `fx commit --stdin` reads one JSON line of the form
+  `{"chain":[{"instance":"rnnoise-1","plugin":"rnnoise","enabled":true},
+  {"instance":"","plugin":"highpass","controls":{"freq":120}}]}`. Existing
+  instances keep their stored controls; empty instances get new ids and manifest
+  defaults. It validates and renders before saving, then writes `state.json`
+  and restarts audio once. The Effects window uses this command for Apply. With
+  `--json`, the result is `{"ok":true,"restarted":true,"chain":[...]}` or
+  `{"ok":false,"error":"..."}`.
 - `fx render` is the non-disruptive path; `fx apply` is the retry path after a
   failed restart.
+
+The floating window uses `fx commit` so a whole staged edit restarts audio
+once. The individual `fx add/remove/move/toggle` commands remain available for
+scripts and each still restarts on its own.
 
 The legacy RNNoise aliases remain:
 
@@ -390,7 +441,9 @@ CHANGELOG.md                    Release notes
 bin/wavemix                     PipeWire channel mixer CLI and watcher
 bin/wavemix_fx.py               Manifest discovery, state, and chain compiler
 plugin/manifest.json            Omarchy bar-widget manifest
-plugin/Panel.qml                Bar widget, mixer panel, and Effects popup
+plugin/Panel.qml                Bar widget and mixer panel
+fx-plugin/manifest.json         Omarchy panel manifest for the Effects window
+fx-plugin/FxWindow.qml          Floating Effects window UI
 plugins/*.json                  Bundled effect manifests
 systemd/wavemix.service         User service that keeps the graph reconciled
 tests/test_wavemix.py           Unit tests
@@ -412,7 +465,7 @@ python3 -m py_compile bin/wavemix bin/wavemix_fx.py
 bash -n install.sh
 ```
 
-The QML popup has no automated harness and is verified manually.
+The QML window has no automated harness and is verified manually.
 
 ## Uninstall
 

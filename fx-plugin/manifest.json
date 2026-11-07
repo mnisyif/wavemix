@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "mnisyif.wavemix-fx",
+  "name": "Wavemix Effects",
+  "version": "1.2.0",
+  "author": "mnisyif",
+  "description": "Edit the Wavemix microphone effect chain",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "FxWindow.qml"
+  }
+}

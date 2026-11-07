@@ -61,7 +61,7 @@ class ManifestTests(unittest.TestCase):
     }
     manifest = wavemix_fx.normalize_manifest(
       data, source="bundled", path=Path("/tmp/demo.json"),
-      version="1.1.0")
+      version=wavemix_fx.WAVEMIX_VERSION)
     self.assertTrue(manifest["available"])
     self.assertIsNone(manifest["error"])
     self.assertEqual(manifest["allowMultiple"], True)
@@ -91,7 +91,7 @@ class ManifestTests(unittest.TestCase):
         json.dumps(manifest_data("ok")), encoding="utf-8")
 
       manifests = wavemix_fx.discover_manifests(
-        bundled, root / "user", "1.1.0")
+        bundled, root / "user", wavemix_fx.WAVEMIX_VERSION)
 
       self.assertFalse(manifests["future"]["available"])
       self.assertIn("schemaVersion", manifests["future"]["error"])
@@ -164,7 +164,8 @@ class ManifestTests(unittest.TestCase):
       broken = manifest_data("broken", "1.0.0", config={"x": None})
       (user / "broken.json").write_text(json.dumps(broken), encoding="utf-8")
 
-      manifests = wavemix_fx.discover_manifests(bundled, user, "1.1.0")
+      manifests = wavemix_fx.discover_manifests(
+        bundled, user, wavemix_fx.WAVEMIX_VERSION)
 
       self.assertTrue(manifests["demo"]["available"])
       self.assertIsNone(manifests["demo"]["error"])
@@ -272,7 +273,23 @@ class ManifestTests(unittest.TestCase):
 
     self.assertEqual(set(row), {
       "id", "name", "description", "version", "schemaVersion", "minWavemix",
-      "source", "available", "gpu", "requires", "error"})
+      "source", "available", "gpu", "requires", "error", "type",
+      "allowMultiple", "controls"})
+
+  def test_plugin_list_includes_type_gpu_and_control_defaults(self):
+    manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path("/nonexistent"), "1.1.0")
+    rows = {row["id"]: row for row in wavemix_fx.plugin_list(manifests)}
+    highpass = rows["highpass"]
+    self.assertEqual(highpass["type"], "builtin")
+    self.assertFalse(highpass["gpu"])
+    self.assertTrue(highpass["allowMultiple"])
+    freq = next(c for c in highpass["controls"] if c["key"] == "freq")
+    self.assertEqual(freq["default"], 80)
+    self.assertEqual(freq["min"], 20)
+    self.assertEqual(freq["max"], 500)
+    self.assertTrue(rows["maxine-denoise"]["gpu"])
+    self.assertEqual(rows["rnnoise"]["type"], "ladspa")
 
 
 class StateTests(unittest.TestCase):
@@ -381,6 +398,91 @@ class StateTests(unittest.TestCase):
       state, self.manifests, "highpass-1"))
 
 
+class ChainReplaceTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls._user_dir = tempfile.TemporaryDirectory()
+    cls.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
+
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
+
+  def state_with_rnnoise(self):
+    return {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "pluginVersion": "1.0.0",
+       "enabled": True, "controls": {"vadThreshold": 60}, "custom": "keep"}]}}
+
+  def test_replace_chain_reorders_and_preserves_controls(self):
+    state = self.state_with_rnnoise()
+    state["micFx"]["chain"].append({
+      "id": "highpass-1", "plugin": "highpass", "pluginVersion": "1.0.0",
+      "enabled": True, "controls": {"freq": 120}})
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "highpass-1", "plugin": "highpass"},
+      {"instance": "rnnoise-1", "plugin": "rnnoise"}])
+    self.assertEqual([item["id"] for item in chain],
+                     ["highpass-1", "rnnoise-1"])
+    self.assertEqual(chain[1]["controls"]["vadThreshold"], 60)
+    self.assertEqual(chain[1]["custom"], "keep")
+
+  def test_replace_chain_adds_new_with_controls_and_unique_id(self):
+    state = self.state_with_rnnoise()
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "rnnoise-1", "plugin": "rnnoise"},
+      {"instance": "", "plugin": "highpass",
+       "controls": {"freq": 200}}])
+    self.assertEqual(chain[1]["id"], "highpass-1")
+    self.assertEqual(chain[1]["controls"]["freq"], 200)
+
+  def test_replace_chain_rejects_unknown_instance_and_plugin_mismatch(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "missing-1", "plugin": "rnnoise"}])
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "rnnoise-1", "plugin": "highpass"}])
+
+  def test_replace_chain_rejects_unavailable_new_plugin(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "", "plugin": "maxine-denoise"}])
+
+  def test_replace_chain_rejects_duplicate_ids(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "rnnoise-1", "plugin": "rnnoise"},
+        {"instance": "rnnoise-1", "plugin": "rnnoise"}])
+
+  def test_replace_chain_toggles_bypass(self):
+    state = self.state_with_rnnoise()
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "rnnoise-1", "plugin": "rnnoise", "enabled": False}])
+    self.assertFalse(chain[0]["enabled"])
+
+  def test_replace_chain_rejects_invalid_control_values(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "", "plugin": "highpass",
+         "controls": {"freq": "loud"}}])
+
+  def test_replace_chain_rejects_disallowed_multiple(self):
+    state = self.state_with_rnnoise()
+    manifests = dict(self.manifests)
+    manifests["highpass"] = dict(manifests["highpass"], allowMultiple=False)
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, manifests, [
+        {"instance": "", "plugin": "highpass"},
+        {"instance": "", "plugin": "highpass"}])
+
+
 class CompilerTests(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
@@ -484,12 +586,14 @@ class CompilerTests(unittest.TestCase):
   def test_quotes_and_backslashes_are_escaped(self):
     manifest = wavemix_fx.normalize_manifest(
       manifest_data("demo", label='bad"label\\path'),
-      source="user", path=Path("/tmp/demo.json"), version="1.1.0")
+      source="user", path=Path("/tmp/demo.json"),
+      version=wavemix_fx.WAVEMIX_VERSION)
     state = {"version": 2, "micFx": {"enabled": True, "chain": [
       {"id": "demo-1", "plugin": "demo", "enabled": True,
        "controls": {}}]}}
 
-    text = wavemix_fx.render_config(state, {"demo": manifest}, "1.1.0")
+    text = wavemix_fx.render_config(
+      state, {"demo": manifest}, wavemix_fx.WAVEMIX_VERSION)
 
     self.assertIn('label = "bad\\"label\\\\path"', text)
     self.assertNotIn('bad"label', text)
@@ -1020,6 +1124,7 @@ class CliFxTests(unittest.TestCase):
     entry = out["chain"][0]
     self.assertEqual(entry["instance"], "rnnoise-1")
     self.assertEqual(entry["plugin"], "rnnoise")
+    self.assertEqual(entry["type"], "ladspa")
     self.assertEqual(entry["pluginVersion"],
                      self.manifests["rnnoise"]["version"])
     self.assertFalse(entry["versionChanged"])
@@ -1102,6 +1207,113 @@ class CliFxTests(unittest.TestCase):
         up.assert_called_once()
         self.assertEqual(up.call_args.args[0]["micFx"]["enabled"], after)
         restart.assert_not_called()
+
+
+  def commit(self, payload, restart=True):
+    stdin = io.StringIO(json.dumps(payload) + "\n")
+    output = io.StringIO()
+    restart_mock = Mock(return_value=restart)
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         patch.object(wavemix, "restart_audio", restart_mock), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    return code, output.getvalue(), restart_mock
+
+  def test_fx_commit_replaces_chain_and_restarts_once(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    code, out, restart = self.commit({"chain": [
+      {"instance": "rnnoise-1", "plugin": "rnnoise", "enabled": False},
+      {"instance": "", "plugin": "highpass", "controls": {"freq": 120}}]})
+    self.assertEqual(code, 0)
+    result = json.loads(out)
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["restarted"])
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual([i["id"] for i in saved["micFx"]["chain"]],
+                     ["rnnoise-1", "highpass-1"])
+    self.assertFalse(saved["micFx"]["chain"][0]["enabled"])
+    self.assertEqual(saved["micFx"]["chain"][1]["controls"]["freq"], 120)
+    self.assertIn('"Freq" = 120', self.config.read_text(encoding="utf-8"))
+    restart.assert_called_once_with()
+
+  def test_fx_commit_render_failure_leaves_state_untouched(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    before = self.state_file.read_text(encoding="utf-8")
+    with patch.object(wavemix.fx, "render_to_disk",
+                      side_effect=wavemix.fx.FxError("render failed")):
+      code, out, restart = self.commit({"chain": []})
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(out)["ok"])
+    self.assertEqual(self.state_file.read_text(encoding="utf-8"), before)
+    restart.assert_not_called()
+
+  def test_fx_commit_restart_failure_reports_not_restarted(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    code, out, restart = self.commit({"chain": []}, restart=False)
+    self.assertEqual(code, 0)
+    result = json.loads(out)
+    self.assertTrue(result["ok"])
+    self.assertFalse(result["restarted"])
+    self.assertEqual(json.loads(
+      self.state_file.read_text(encoding="utf-8"))["micFx"]["chain"], [])
+
+  def test_fx_commit_rejects_malformed_json(self):
+    self.write_state(enabled=True, chain=[])
+    stdin = io.StringIO("{not json\n")
+    output = io.StringIO()
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(output.getvalue())["ok"])
+
+  def test_fx_commit_reloads_state_inside_the_lock(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    old = json.loads(self.state_file.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(old))
+    fresh["devices"]["output"] = "new-output"
+    stdin = io.StringIO(json.dumps({"chain": [
+      {"instance": "rnnoise-1", "plugin": "rnnoise"}]}) + "\n")
+    output = io.StringIO()
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         patch.object(wavemix, "restart_audio", Mock(return_value=True)), \
+         patch.object(wavemix, "load_state", side_effect=[old, fresh]), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    self.assertEqual(code, 0)
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual(saved["devices"]["output"], "new-output")
+
+  def test_fx_set_reloads_state_inside_the_lock(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    old = json.loads(self.state_file.read_text(encoding="utf-8"))
+    fresh = json.loads(json.dumps(old))
+    fresh["devices"]["output"] = "new-output"
+    with patch.object(wavemix, "load_state", side_effect=[old, fresh]), \
+         patch.object(wavemix.fx, "find_capture_node_id", return_value=None), \
+         contextlib.redirect_stdout(io.StringIO()):
+      code = wavemix.main(["fx", "set", "rnnoise-1", "vadThreshold", "60"])
+    self.assertEqual(code, 0)
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual(saved["devices"]["output"], "new-output")
+
+  def test_fx_commit_validation_failure_leaves_state_untouched(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    before = self.state_file.read_text(encoding="utf-8")
+    code, out, restart = self.commit({"chain": [
+      {"instance": "missing-1", "plugin": "rnnoise"}]})
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(out)["ok"])
+    self.assertEqual(self.state_file.read_text(encoding="utf-8"), before)
+    restart.assert_not_called()
+
+  def test_fx_commit_requires_stdin(self):
+    self.write_state(enabled=True, chain=[])
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--json"])
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(output.getvalue())["ok"])
 
 
 class UpReapplyTests(unittest.TestCase):
