@@ -406,10 +406,13 @@ Panel {
   }
   function openMicFx() {
     if (root.opened) root.close()
+    var opened = false
     if (root.bar && root.bar.shell
         && typeof root.bar.shell.toggle === "function")
-      root.bar.shell.toggle("mnisyif.wavemix-fx")
-    else
+      opened = root.bar.shell.toggle("mnisyif.wavemix-fx")
+    // A third-party bar widget's scoped shell cannot control a separate panel
+    // plugin; toggle() returns false in that case. Fall back to the shell CLI.
+    if (!opened && root.bar)
       root.bar.run("omarchy-shell shell toggle mnisyif.wavemix-fx")
   }
   implicitWidth: icons.implicitWidth
