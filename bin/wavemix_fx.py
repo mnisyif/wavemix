@@ -1,6 +1,7 @@
 """Manifest-driven microphone effect chain for Wavemix."""
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -582,6 +583,117 @@ def find_instance(state: dict, instance_id: str) -> dict | None:
   return None
 
 
+def _next_instance_id(chain: list, plugin_id: str) -> str:
+  """The first free `<plugin>-<n>` id in a chain."""
+  used: set[int] = set()
+  prefix = f"{plugin_id}-"
+  for instance in chain:
+    ident = instance.get("id") if isinstance(instance, dict) else None
+    if not isinstance(ident, str) or not ident.startswith(prefix):
+      continue
+    suffix = ident[len(prefix):]
+    if suffix.isdigit() and int(suffix) > 0:
+      used.add(int(suffix))
+
+  number = 1
+  while number in used:
+    number += 1
+  return f"{plugin_id}-{number}"
+
+
+def _control_specs(manifest: dict) -> dict[str, dict]:
+  return {control["key"]: control
+          for control in manifest.get("controls", [])
+          if isinstance(control, dict) and control.get("key")}
+
+
+def replace_chain(state: dict, manifests: dict[str, dict],
+                  entries: list[dict]) -> list[dict]:
+  """Replace the whole chain in one validated pass.
+
+  Existing instances keep their stored controls and unknown fields. New
+  entries get generated ids and manifest defaults, with optional control
+  overrides. The caller passes a candidate state copy."""
+  if not isinstance(entries, list):
+    raise FxError("chain must be a list")
+
+  existing_chain = _read_chain(state) or []
+  existing = {
+    instance.get("id"): instance
+    for instance in existing_chain
+    if isinstance(instance, dict) and isinstance(instance.get("id"), str)
+  }
+
+  new_chain: list[dict] = []
+  seen: set[str] = set()
+  for entry in entries:
+    if not isinstance(entry, dict):
+      raise FxError("each chain entry must be an object")
+
+    plugin_id = entry.get("plugin")
+    if not isinstance(plugin_id, str) or not plugin_id:
+      raise FxError("each chain entry needs a plugin")
+
+    raw_instance = entry.get("instance", "")
+    if raw_instance is None:
+      raw_instance = ""
+    if not isinstance(raw_instance, str):
+      raise FxError("instance must be a string")
+    instance_id = raw_instance
+    enabled = bool(entry.get("enabled", True))
+
+    if instance_id:
+      if instance_id in seen:
+        raise FxError(f"duplicate instance id '{instance_id}'")
+      stored = existing.get(instance_id)
+      if stored is None:
+        raise FxError(f"no such effect instance: {instance_id}")
+      if stored.get("plugin") != plugin_id:
+        raise FxError(
+          f"instance '{instance_id}' belongs to plugin "
+          f"'{stored.get('plugin')}', not '{plugin_id}'")
+      seen.add(instance_id)
+      item = copy.deepcopy(stored)
+      item["enabled"] = enabled
+      new_chain.append(item)
+      continue
+
+    manifest = manifests.get(plugin_id)
+    if not isinstance(manifest, dict):
+      raise FxError(f"unknown plugin '{plugin_id}'")
+    if not manifest.get("available") or manifest.get("error"):
+      reason = manifest.get("error") or manifest.get("requires") \
+          or "plugin is unavailable"
+      raise FxError(f"cannot add plugin '{plugin_id}': {reason}")
+
+    new_id = _next_instance_id(existing_chain + new_chain, plugin_id)
+    item = _new_instance(plugin_id, new_id, manifest)
+    item["enabled"] = enabled
+
+    provided = entry.get("controls")
+    if provided is not None and not isinstance(provided, dict):
+      raise FxError(f"controls for '{plugin_id}' must be an object")
+    if isinstance(provided, dict):
+      specs = _control_specs(manifest)
+      controls = item.setdefault("controls", {})
+      for key, value in provided.items():
+        spec = specs.get(key)
+        if spec is None:
+          raise FxError(f"no such control '{key}' for {plugin_id}")
+        controls[key] = _clamp_display(spec, value)
+
+    new_chain.append(item)
+
+  for plugin_id, manifest in manifests.items():
+    if not isinstance(manifest, dict) or manifest.get("allowMultiple", True):
+      continue
+    if sum(1 for item in new_chain if item.get("plugin") == plugin_id) > 1:
+      raise FxError(f"plugin '{plugin_id}' does not allow multiple instances")
+
+  _micfx(state)["chain"] = new_chain
+  return new_chain
+
+
 def add_instance(state: dict, manifests: dict[str, dict], plugin_id: str,
                  index: int | None = None) -> dict:
   """Add one instance, returning it, or raise FxError for an unusable plugin."""
@@ -599,20 +711,8 @@ def add_instance(state: dict, manifests: dict[str, dict], plugin_id: str,
               and instance.get("plugin") == plugin_id for instance in chain):
     raise FxError(f"plugin '{plugin_id}' does not allow multiple instances")
 
-  used: set[int] = set()
-  prefix = f"{plugin_id}-"
-  for instance in chain:
-    ident = instance.get("id") if isinstance(instance, dict) else None
-    if not isinstance(ident, str) or not ident.startswith(prefix):
-      continue
-    suffix = ident[len(prefix):]
-    if suffix.isdigit() and int(suffix) > 0:
-      used.add(int(suffix))
-
-  number = 1
-  while number in used:
-    number += 1
-  instance = _new_instance(plugin_id, f"{plugin_id}-{number}", manifest)
+  instance = _new_instance(
+    plugin_id, _next_instance_id(chain, plugin_id), manifest)
 
   if index is None:
     chain.append(instance)

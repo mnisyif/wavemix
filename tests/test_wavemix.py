@@ -397,6 +397,75 @@ class StateTests(unittest.TestCase):
       state, self.manifests, "highpass-1"))
 
 
+class ChainReplaceTests(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls._user_dir = tempfile.TemporaryDirectory()
+    cls.manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path(cls._user_dir.name), "1.1.0")
+    cls.manifests["rnnoise"]["available"] = True
+    cls.manifests["rnnoise"]["error"] = None
+
+  @classmethod
+  def tearDownClass(cls):
+    cls._user_dir.cleanup()
+
+  def state_with_rnnoise(self):
+    return {"version": 2, "micFx": {"enabled": True, "chain": [
+      {"id": "rnnoise-1", "plugin": "rnnoise", "pluginVersion": "1.0.0",
+       "enabled": True, "controls": {"vadThreshold": 60}, "custom": "keep"}]}}
+
+  def test_replace_chain_reorders_and_preserves_controls(self):
+    state = self.state_with_rnnoise()
+    state["micFx"]["chain"].append({
+      "id": "highpass-1", "plugin": "highpass", "pluginVersion": "1.0.0",
+      "enabled": True, "controls": {"freq": 120}})
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "highpass-1", "plugin": "highpass"},
+      {"instance": "rnnoise-1", "plugin": "rnnoise"}])
+    self.assertEqual([item["id"] for item in chain],
+                     ["highpass-1", "rnnoise-1"])
+    self.assertEqual(chain[1]["controls"]["vadThreshold"], 60)
+    self.assertEqual(chain[1]["custom"], "keep")
+
+  def test_replace_chain_adds_new_with_controls_and_unique_id(self):
+    state = self.state_with_rnnoise()
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "rnnoise-1", "plugin": "rnnoise"},
+      {"instance": "", "plugin": "highpass",
+       "controls": {"freq": 200}}])
+    self.assertEqual(chain[1]["id"], "highpass-1")
+    self.assertEqual(chain[1]["controls"]["freq"], 200)
+
+  def test_replace_chain_rejects_unknown_instance_and_plugin_mismatch(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "missing-1", "plugin": "rnnoise"}])
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "rnnoise-1", "plugin": "highpass"}])
+
+  def test_replace_chain_rejects_unavailable_new_plugin(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "", "plugin": "maxine-denoise"}])
+
+  def test_replace_chain_rejects_duplicate_ids(self):
+    state = self.state_with_rnnoise()
+    with self.assertRaises(wavemix_fx.FxError):
+      wavemix_fx.replace_chain(state, self.manifests, [
+        {"instance": "rnnoise-1", "plugin": "rnnoise"},
+        {"instance": "rnnoise-1", "plugin": "rnnoise"}])
+
+  def test_replace_chain_toggles_bypass(self):
+    state = self.state_with_rnnoise()
+    chain = wavemix_fx.replace_chain(state, self.manifests, [
+      {"instance": "rnnoise-1", "plugin": "rnnoise", "enabled": False}])
+    self.assertFalse(chain[0]["enabled"])
+
+
 class CompilerTests(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
