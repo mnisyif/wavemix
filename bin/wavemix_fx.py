@@ -19,7 +19,7 @@ _CONTROL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _MANIFEST_TYPES = ("ladspa", "lv2", "builtin")
 _PLUGIN_LIST_FIELDS = (
   "id", "name", "description", "version", "schemaVersion", "minWavemix",
-  "source", "available", "gpu", "requires", "error",
+  "source", "available", "gpu", "requires", "error", "type", "allowMultiple",
 )
 
 
@@ -410,10 +410,23 @@ def manifest_defaults(manifest: dict) -> dict[str, float | int]:
           for control in manifest.get("controls", [])}
 
 
+_PLUGIN_CONTROL_FIELDS = (
+  "key", "label", "param", "default", "min", "max", "step", "unit",
+  "integer", "raw_float", "scale",
+)
+
+
 def plugin_list(manifests: dict[str, dict]) -> list[dict]:
-  """Stable rows for `wavemix fx plugins` and the popup."""
-  rows = [{field: manifest.get(field) for field in _PLUGIN_LIST_FIELDS}
-          for manifest in manifests.values()]
+  """Stable rows for `wavemix fx plugins` and the effects window."""
+  rows = []
+  for manifest in manifests.values():
+    row = {field: manifest.get(field) for field in _PLUGIN_LIST_FIELDS}
+    row["controls"] = [
+      {key: control.get(key) for key in _PLUGIN_CONTROL_FIELDS}
+      for control in manifest.get("controls", [])
+      if isinstance(control, dict)
+    ]
+    rows.append(row)
   return sorted(rows, key=lambda row: (row["id"], row["source"]))
 
 
@@ -794,6 +807,7 @@ def _instance_snapshot(instance: dict, manifest: dict | None,
   return {
     "instance": instance.get("id"),
     "plugin": plugin,
+    "type": manifest.get("type") if manifest else None,
     "pluginVersion": recorded,
     "versionChanged": version_changed,
     "enabled": bool(instance.get("enabled", True)),

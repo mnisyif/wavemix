@@ -272,7 +272,23 @@ class ManifestTests(unittest.TestCase):
 
     self.assertEqual(set(row), {
       "id", "name", "description", "version", "schemaVersion", "minWavemix",
-      "source", "available", "gpu", "requires", "error"})
+      "source", "available", "gpu", "requires", "error", "type",
+      "allowMultiple", "controls"})
+
+  def test_plugin_list_includes_type_gpu_and_control_defaults(self):
+    manifests = wavemix_fx.discover_manifests(
+      ROOT / "plugins", Path("/nonexistent"), "1.1.0")
+    rows = {row["id"]: row for row in wavemix_fx.plugin_list(manifests)}
+    highpass = rows["highpass"]
+    self.assertEqual(highpass["type"], "builtin")
+    self.assertFalse(highpass["gpu"])
+    self.assertTrue(highpass["allowMultiple"])
+    freq = next(c for c in highpass["controls"] if c["key"] == "freq")
+    self.assertEqual(freq["default"], 80)
+    self.assertEqual(freq["min"], 20)
+    self.assertEqual(freq["max"], 500)
+    self.assertTrue(rows["maxine-denoise"]["gpu"])
+    self.assertEqual(rows["rnnoise"]["type"], "ladspa")
 
 
 class StateTests(unittest.TestCase):
@@ -1020,6 +1036,7 @@ class CliFxTests(unittest.TestCase):
     entry = out["chain"][0]
     self.assertEqual(entry["instance"], "rnnoise-1")
     self.assertEqual(entry["plugin"], "rnnoise")
+    self.assertEqual(entry["type"], "ladspa")
     self.assertEqual(entry["pluginVersion"],
                      self.manifests["rnnoise"]["version"])
     self.assertFalse(entry["versionChanged"])
