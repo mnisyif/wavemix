@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.3.0] - 2026-11-07
+
+### Added
+
+- Mixer, Effects, and Devices tabs in the bar popup, each with independent
+  scrolling and a persistent Wavemix hero.
+- A five-channel Mixer viewport: five channel cards fit before the list starts
+  scrolling.
+- An FX state badge beside the mute switches, with inverted colors for on and
+  off states.
+- An LSP Expander LV2 manifest for gentle downward expansion, with conservative
+  defaults and live controls.
+- LV2 port-symbol guidance for manifest authors.
+
+### Changed
+
+- Channel and device sections are rebuilt as quiet cards with clearer type,
+  spacing, and neutral borders.
+- Send labels are now `Output` and `Stream` instead of `out` and `stream`.
+- The MIC FX row is labelled `Effects chain`, since the chain is not limited to
+  noise suppression.
+- The hover tooltip separates state, device, and click actions into four short
+  lines.
+
+### Fixed
+
+- Send sliders hold the released value until the status poll confirms it,
+  preventing the quick-change bounce between the old and new levels.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added

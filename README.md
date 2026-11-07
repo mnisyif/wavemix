@@ -189,7 +189,7 @@ shows a warning in its settings area, not an error row.
 NVIDIA Maxine, DeepFilterNet, and any other GPU-backed manifest compile through
 the same chain as RNNoise. VST3 and CLAP cannot run in PipeWire's native
 filter-chain; a future release will host them through a Carla + OSC backend.
-That backend is not part of 1.2.0.
+That backend is not part of 1.3.0.
 
 ## Effect manifests
 
@@ -328,7 +328,7 @@ installing a plugin.
 ## Versioning and compatibility
 
 - The core version is stored in `VERSION` and reported by `wavemix --version`
-  (`wavemix 1.1.0`).
+  (`wavemix 1.3.0`).
 - `wavemix fx plugins --json` and `wavemix fx state --json` include
   `wavemixVersion`.
 - Every manifest declares `schemaVersion` (currently `1`) and its own `version`.
