@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- License changed from MIT to Apache-2.0 with a `NOTICE` attribution
+  requirement that references the repository.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added
