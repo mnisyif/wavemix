@@ -1190,6 +1190,65 @@ class CliFxTests(unittest.TestCase):
         restart.assert_not_called()
 
 
+  def commit(self, payload, restart=True):
+    stdin = io.StringIO(json.dumps(payload) + "\n")
+    output = io.StringIO()
+    restart_mock = Mock(return_value=restart)
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         patch.object(wavemix, "restart_audio", restart_mock), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    return code, output.getvalue(), restart_mock
+
+  def test_fx_commit_replaces_chain_and_restarts_once(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    code, out, restart = self.commit({"chain": [
+      {"instance": "rnnoise-1", "plugin": "rnnoise", "enabled": False},
+      {"instance": "", "plugin": "highpass", "controls": {"freq": 120}}]})
+    self.assertEqual(code, 0)
+    result = json.loads(out)
+    self.assertTrue(result["ok"])
+    self.assertTrue(result["restarted"])
+    saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+    self.assertEqual([i["id"] for i in saved["micFx"]["chain"]],
+                     ["rnnoise-1", "highpass-1"])
+    self.assertFalse(saved["micFx"]["chain"][0]["enabled"])
+    self.assertEqual(saved["micFx"]["chain"][1]["controls"]["freq"], 120)
+    self.assertIn('"Freq" = 120', self.config.read_text(encoding="utf-8"))
+    restart.assert_called_once_with()
+
+  def test_fx_commit_render_failure_leaves_state_untouched(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    before = self.state_file.read_text(encoding="utf-8")
+    with patch.object(wavemix.fx, "render_to_disk",
+                      side_effect=wavemix.fx.FxError("render failed")):
+      code, out, restart = self.commit({"chain": []})
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(out)["ok"])
+    self.assertEqual(self.state_file.read_text(encoding="utf-8"), before)
+    restart.assert_not_called()
+
+  def test_fx_commit_restart_failure_reports_not_restarted(self):
+    self.write_state(enabled=True, chain=[self.rnnoise_instance()])
+    code, out, restart = self.commit({"chain": []}, restart=False)
+    self.assertEqual(code, 0)
+    result = json.loads(out)
+    self.assertTrue(result["ok"])
+    self.assertFalse(result["restarted"])
+    self.assertEqual(json.loads(
+      self.state_file.read_text(encoding="utf-8"))["micFx"]["chain"], [])
+
+  def test_fx_commit_rejects_malformed_json(self):
+    self.write_state(enabled=True, chain=[])
+    stdin = io.StringIO("{not json\n")
+    output = io.StringIO()
+    with patch.object(wavemix.sys, "stdin", stdin), \
+         contextlib.redirect_stdout(output):
+      code = wavemix.main(["fx", "commit", "--stdin", "--json"])
+    self.assertNotEqual(code, 0)
+    self.assertFalse(json.loads(output.getvalue())["ok"])
+
+
 class UpReapplyTests(unittest.TestCase):
   def test_up_reapplies_stored_chain_controls(self):
     state = {"version": 2,
